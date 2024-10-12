@@ -1,14 +1,12 @@
-use clap::{Arg, Command};
-use colored::*;
+use clap::{Arg, ArgAction, Command};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::env;
 use std::fs;
 use std::io::{self, Read};
 use std::path::PathBuf;
-use std::process::{Command as ProcessCommand, Stdio};
+use std::process::Command as ProcessCommand;
 
-const API_KEY: &str = "YOUR_API_KEY_HERE";
 const MODEL: &str = "o1-mini";
 const HOST: &str = "api.openai.com";
 const ENDPOINT: &str = "/v1/chat/completions";
@@ -34,40 +32,49 @@ struct ConversationState {
     messages: Vec<Message>,
 }
 
+fn get_api_key() -> String {
+    env::var("OPENAI_API_KEY").expect("OPENAI_API_KEY must be set")
+}
+
 fn main() {
     let matches = Command::new("ask")
         .version("1.0")
         .author("Rodrigo Ourique")
         .about("Rust terminal LLM caller")
-        .arg(Arg::new("input").multiple_values(true))
+        .arg(
+            Arg::new("input")
+                .help("Input values")
+                .num_args(1..) // Replaces multiple_values(true)
+        )
         .arg(
             Arg::new("image")
                 .short('i')
-                .about("Push image from clipboard into pipeline")
-                .takes_value(false),
+                .help("Push image from clipboard into pipeline")
+                .action(ArgAction::SetTrue) // Replaces takes_value(false)
         )
         .arg(
             Arg::new("manage")
                 .short('o')
-                .about("Manage ongoing conversations")
-                .takes_value(false),
+                .help("Manage ongoing conversations")
+                .action(ArgAction::SetTrue)
         )
         .arg(
             Arg::new("clear")
                 .short('c')
-                .about("Clear current conversation")
-                .takes_value(false),
+                .help("Clear current conversation")
+                .action(ArgAction::SetTrue)
         )
         .arg(
             Arg::new("last")
                 .short('l')
-                .about("Get last message")
-                .takes_value(false),
+                .help("Get last message")
+                .action(ArgAction::SetTrue)
         )
         .get_matches();
 
-    if API_KEY.is_empty() {
-        eprintln!("Missing API key! Add one to the script and try again.");
+    let api_key = get_api_key();
+    if api_key.is_empty() {
+        eprintln!("Missing API key! Set the OPENAI_API_KEY environment variable and try again.");
         std::process::exit(1);
     }
 
@@ -94,21 +101,24 @@ fn main() {
         }
     };
 
-    if matches.is_present("manage") && !matches.is_present("input") {
+    if matches.get_flag("manage") && !matches.get_one::<String>("input").is_some() {
         manage_ongoing_convos();
         return;
-    } else if matches.is_present("clear") && !matches.is_present("input") {
+    } else if matches.get_flag("clear") && !matches.get_one::<String>("input").is_some() {
         clear_current_convo(&transcript_path);
         return;
-    } else if matches.is_present("last") && !matches.is_present("input") {
+    } else if matches.get_flag("last") && !matches.get_one::<String>("input").is_some() {
         if let Some(last_message) = conversation_state.messages.last() {
             println!("{}", serde_json::to_string(&last_message.content).unwrap());
         }
         return;
     }
 
-    let mut input = if let Some(values) = matches.values_of("input") {
-        let input_str = values.collect::<Vec<&str>>().join(" ");
+    let mut input = if let Some(values) = matches.get_many::<String>("input") {
+        let input_str = values
+            .map(|s| s.as_str()) // Convert &String to &str
+            .collect::<Vec<&str>>() // Collect into Vec<&str>
+            .join(" "); // Join with spaces
         Value::String(input_str)
     } else {
         let mut buffer = String::new();
@@ -120,7 +130,7 @@ fn main() {
 
     let clipboard_command = detect_clipboard_command();
 
-    if matches.is_present("image") {
+    if matches.get_flag("image") {
         add_image_to_pipeline(&mut input, &clipboard_command);
     }
 
@@ -211,7 +221,7 @@ fn perform_request(
     let client = reqwest::blocking::Client::new();
     let res = client
         .post(&format!("https://{}{}", HOST, ENDPOINT))
-        .header("Authorization", format!("Bearer {}", API_KEY))
+        .header("Authorization", format!("Bearer {}", get_api_key()))
         .json(&body)
         .send();
 
@@ -262,8 +272,8 @@ fn process_response(
 
 fn clear_current_convo(transcript_path: &PathBuf) {
     match fs::remove_file(transcript_path) {
-        Ok(_) => {}
-        Err(e) => println!("{}", e),
+        Ok(_) => println!("Conversation cleared."),
+        Err(e) => println!("Error clearing conversation: {}", e),
     }
 }
 
@@ -333,9 +343,9 @@ fn manage_ongoing_convos() {
         let data = fs::read_to_string(file).expect("Unable to read transcript file");
         let convo: ConversationState =
             serde_json::from_str(&data).expect("Unable to parse transcript JSON");
-        let first_message = &convo.messages[1];
-        let content = if let Some(text) = first_message.content.as_str() {
-            text
+        let first_message = convo.messages.get(1); // Use get to avoid panicking
+        let content = if let Some(msg) = first_message {
+            msg.content.as_str().unwrap_or("")
         } else {
             ""
         };
