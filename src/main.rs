@@ -8,6 +8,7 @@ use std::fs;
 use std::io::{self, Read};
 use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
+use std::os::unix::process;
 
 const MODEL: &str = "o1-mini";
 const HOST: &str = "api.openai.com";
@@ -15,8 +16,6 @@ const ENDPOINT: &str = "/v1/chat/completions";
 const MAX_TOKENS: u32 = 2048;
 const TEMPERATURE: f64 = 0.6;
 const VISION_DETAIL: &str = "high";
-const ACCENT_COLOR: &str = "\x1b[30m\x1b[42m";
-const RESET: &str = "\x1b[0m";
 const TRANSCRIPT_NAME: &str = "gpt_transcript-";
 const CLIPBOARD_COMMAND_XORG: &str = "xclip -selection clipboard -t image/png -o";
 const CLIPBOARD_COMMAND_WAYLAND: &str = "wl-paste";
@@ -81,7 +80,7 @@ fn main() {
     }
 
     let temp_dir = env::temp_dir();
-    let transcript_path = temp_dir.join(format!("{}{}", TRANSCRIPT_NAME, std::process::id()));
+    let transcript_path = temp_dir.join(format!("{}{}", TRANSCRIPT_NAME, process::parent_id()));
 
     let mut conversation_state = if transcript_path.exists() {
         let data = fs::read_to_string(&transcript_path).expect("Unable to read transcript file");
