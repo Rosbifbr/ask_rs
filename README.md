@@ -14,6 +14,8 @@ First off, be sure to configure your OPENAI_API_KEY environment variable, like s
 
 The operating principle is very simple. Call the program, wait for a response and answer at will.
 
+![image](https://github.com/user-attachments/assets/8ef71d4a-090b-41af-bc70-cf3e32c83ddc)
+
 `ask "Hi there"` - Prompts the model.
 
 `ask Unqouted strings work too!` - Prompts the model.
