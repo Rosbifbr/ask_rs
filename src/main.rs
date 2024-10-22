@@ -6,9 +6,9 @@ use serde_json::Value;
 use std::env;
 use std::fs;
 use std::io::{self, Read};
+use std::os::unix::process;
 use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
-use std::os::unix::process;
 
 const MODEL: &str = "o1-mini";
 const HOST: &str = "api.openai.com";
@@ -43,9 +43,7 @@ fn main() {
         .author("Rodrigo Ourique")
         .about("Rust terminal LLM caller")
         .arg(
-            Arg::new("input")
-                .help("Input values")
-                .num_args(0..), // Allow zero or more arguments
+            Arg::new("input").help("Input values").num_args(0..), // Allow zero or more arguments
         )
         .arg(
             Arg::new("image")
@@ -326,16 +324,34 @@ fn show_history(conversation_state: &ConversationState) {
 }
 
 fn horizontal_line(ch: char) -> String {
-    let columns = term_size::dimensions_stdout()
-        .map(|(w, _)| w)
-        .unwrap_or(80);
+    let columns = term_size::dimensions_stdout().map(|(w, _)| w).unwrap_or(80);
     ch.to_string().repeat(columns)
 }
 
-fn manage_ongoing_convos(
-    current_convo: &mut ConversationState,
-    current_transcript_path: &PathBuf,
-) {
+fn delete_all_files(files: Vec<PathBuf>) {
+    // Delete all conversations
+    let confirm = dialoguer::Confirm::new()
+        .with_prompt("Are you sure you want to delete all conversations?")
+        .default(false)
+        .interact()
+        .unwrap_or(false);
+
+    if confirm {
+        let mut deleted_count = 0;
+        for file in &files {
+            if let Err(e) = fs::remove_file(file) {
+                eprintln!("Failed to delete {}: {}", file.display(), e);
+            } else {
+                deleted_count += 1;
+            }
+        }
+        println!("Deleted {} conversation(s).", deleted_count);
+    } else {
+        println!("Operation cancelled.");
+    }
+}
+
+fn manage_ongoing_convos(current_convo: &mut ConversationState, current_transcript_path: &PathBuf) {
     let transcript_folder = env::temp_dir();
     let entries = fs::read_dir(&transcript_folder).unwrap();
 
@@ -356,7 +372,7 @@ fn manage_ongoing_convos(
     }
 
     // Prepare options for dialoguer
-    let options: Vec<String> = files
+    let mut options: Vec<String> = files
         .iter()
         .map(|file| {
             let data = fs::read_to_string(file).unwrap_or_default();
@@ -374,19 +390,33 @@ fn manage_ongoing_convos(
             format!(
                 "{} => {}",
                 file.file_name().unwrap().to_string_lossy(),
-                content.lines().next().unwrap_or("").chars().take(64).collect::<String>()
+                content
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .chars()
+                    .take(64)
+                    .collect::<String>()
             )
         })
         .collect();
 
+    //Add special helper option
+    options.insert(0, ">>> Delete All Conversations".to_string());
+
     let selection = Select::with_theme(&ColorfulTheme::default())
-        .with_prompt("Select a conversation to manage")
+        .with_prompt("Select an option to manage")
         .default(0)
         .items(&options)
         .interact();
 
     if let Ok(index) = selection {
-        let selected_file = &files[index];
+        if index == 0 {
+            delete_all_files(files);
+            return;
+        }
+
+        let selected_file = &files[index - 1]; //First option is the special helper
         let action = Select::with_theme(&ColorfulTheme::default())
             .with_prompt("Choose an action")
             .default(0)
@@ -416,7 +446,9 @@ fn manage_ongoing_convos(
                     return;
                 }
 
-                current_convo.messages.extend(convo_to_copy.messages.iter().skip(1).cloned()); // Skip initial message
+                current_convo
+                    .messages
+                    .extend(convo_to_copy.messages.iter().skip(1).cloned()); // Skip initial message
                 let conversation_json = serde_json::to_string(&current_convo).unwrap();
                 fs::write(current_transcript_path, conversation_json)
                     .expect("Unable to write transcript file");
