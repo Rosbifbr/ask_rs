@@ -106,23 +106,7 @@ fn main() {
         }
     };
 
-    if matches.get_flag("recursive") {
-        handle_recursive_mode(&mut conversation_state, &transcript_path);
-        return;
-    } else if matches.get_flag("manage") && !matches.get_one::<String>("input").is_some() {
-        manage_ongoing_convos(&mut conversation_state, &transcript_path);
-        return;
-    } else if matches.get_flag("clear") && !matches.get_one::<String>("input").is_some() {
-        clear_current_convo(&transcript_path);
-        return;
-    } else if matches.get_flag("last") && !matches.get_one::<String>("input").is_some() {
-        if let Some(last_message) = conversation_state.messages.last() {
-            println!("{}", serde_json::to_string(&last_message.content).unwrap());
-        }
-        return;
-    }
-
-    // Determine if input is being piped
+    // Determine if input is being piped and get full input
     let input = if !atty::is(Stream::Stdin) {
         // Read from stdin
         let mut buffer = String::new();
@@ -147,11 +131,27 @@ fn main() {
     } else {
         Value::Null
     };
-
     let mut input = input;
+    let input_string = input.to_string();
 
+    if matches.get_flag("recursive") {
+        handle_recursive_mode(&mut conversation_state, &transcript_path, input_string);
+        return;
+    } else if matches.get_flag("manage") && !matches.get_one::<String>("input").is_some() {
+        manage_ongoing_convos(&mut conversation_state, &transcript_path);
+        return;
+    } else if matches.get_flag("clear") && !matches.get_one::<String>("input").is_some() {
+        clear_current_convo(&transcript_path);
+        return;
+    } else if matches.get_flag("last") && !matches.get_one::<String>("input").is_some() {
+        if let Some(last_message) = conversation_state.messages.last() {
+            println!("{}", serde_json::to_string(&last_message.content).unwrap());
+        }
+        return;
+    }
+
+    // Handle image mode
     let clipboard_command = detect_clipboard_command();
-
     if matches.get_flag("image") {
         add_image_to_pipeline(&mut input, &clipboard_command);
     }
@@ -161,6 +161,7 @@ fn main() {
         return;
     }
 
+    // Default case: simple request
     perform_request(
         input,
         &mut conversation_state,
@@ -337,15 +338,19 @@ fn horizontal_line(ch: char) -> String {
     ch.to_string().repeat(columns)
 }
 
-fn handle_recursive_mode(conversation_state: &mut ConversationState, transcript_path: &PathBuf) {
+fn handle_recursive_mode(
+    conversation_state: &mut ConversationState,
+    transcript_path: &PathBuf,
+    user_input: String,
+) {
     loop {
         // Get last AI message to check if it's already a command
         let mut last_message = conversation_state.messages.last().unwrap();
         let mut response = last_message.content.as_str().unwrap_or("");
-        
+
         // If the last message wasn't a command suggestion, ask for one
         if !response.contains("COMMAND:") {
-            let input = Value::String("Suggest the next command to run. Format your response as: COMMAND: <command> followed by an explanation. Or say DONE if the task is complete.".to_string());
+            let input = Value::String(format!("Original task: {}. Suggest the next command to run. Format your response as: COMMAND: <command> followed by an explanation. Or say DONE if the task is complete.", user_input));
             perform_request(input, conversation_state, transcript_path, "");
 
             // Update response with new AI message
@@ -373,17 +378,14 @@ fn handle_recursive_mode(conversation_state: &mut ConversationState, transcript_
 
             if confirm {
                 // Execute command and capture output
-                match ProcessCommand::new("sh")
-                    .arg("-c")
-                    .arg(command)
-                    .output() 
-                {
+                match ProcessCommand::new("sh").arg("-c").arg(command).output() {
                     Ok(output) => {
                         let stdout = String::from_utf8_lossy(&output.stdout);
                         let stderr = String::from_utf8_lossy(&output.stderr);
-                        let result = format!("Command output:\nstdout:\n{}\nstderr:\n{}", stdout, stderr);
-                        println!(result);
-                        
+                        let result =
+                            format!("Command output:\nstdout:\n{}\nstderr:\n{}", stdout, stderr);
+                        println!("{}", result);
+
                         // Pass result back to AI
                         let input = Value::String(result);
                         perform_request(input, conversation_state, transcript_path, "");
@@ -395,7 +397,9 @@ fn handle_recursive_mode(conversation_state: &mut ConversationState, transcript_
                     }
                 }
             } else {
-                let input = Value::String("Command was rejected by user. Please suggest an alternative.".to_string());
+                let input = Value::String(
+                    "Command was rejected by user. Please suggest an alternative.".to_string(),
+                );
                 perform_request(input, conversation_state, transcript_path, "");
             }
         }
