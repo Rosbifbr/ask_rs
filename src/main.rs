@@ -69,6 +69,12 @@ fn main() {
                 .help("Get last message")
                 .action(ArgAction::SetTrue),
         )
+        .arg(
+            Arg::new("recursive")
+                .short('r')
+                .help("Interactive agent mode")
+                .action(ArgAction::SetTrue),
+        )
         .get_matches();
 
     let api_key = get_api_key();
@@ -100,7 +106,10 @@ fn main() {
         }
     };
 
-    if matches.get_flag("manage") && !matches.get_one::<String>("input").is_some() {
+    if matches.get_flag("recursive") {
+        handle_recursive_mode(&mut conversation_state, &transcript_path);
+        return;
+    } else if matches.get_flag("manage") && !matches.get_one::<String>("input").is_some() {
         manage_ongoing_convos(&mut conversation_state, &transcript_path);
         return;
     } else if matches.get_flag("clear") && !matches.get_one::<String>("input").is_some() {
@@ -326,6 +335,71 @@ fn show_history(conversation_state: &ConversationState) {
 fn horizontal_line(ch: char) -> String {
     let columns = term_size::dimensions_stdout().map(|(w, _)| w).unwrap_or(80);
     ch.to_string().repeat(columns)
+}
+
+fn handle_recursive_mode(conversation_state: &mut ConversationState, transcript_path: &PathBuf) {
+    loop {
+        // Get last AI message to check if it's already a command
+        let mut last_message = conversation_state.messages.last().unwrap();
+        let mut response = last_message.content.as_str().unwrap_or("");
+        
+        // If the last message wasn't a command suggestion, ask for one
+        if !response.contains("COMMAND:") {
+            let input = Value::String("Suggest the next command to run. Format your response as: COMMAND: <command> followed by an explanation. Or say DONE if the task is complete.".to_string());
+            perform_request(input, conversation_state, transcript_path, "");
+
+            // Update response with new AI message
+            last_message = conversation_state.messages.last().unwrap();
+            response = last_message.content.as_str().unwrap_or("");
+        }
+
+        // Check if task is complete
+        if response.contains("DONE") {
+            println!("Task completed!");
+            break;
+        }
+
+        // Extract command
+        if let Some(cmd_start) = response.find("COMMAND:") {
+            let cmd_text = response[cmd_start..].lines().next().unwrap();
+            let command = cmd_text.trim_start_matches("COMMAND:").trim();
+
+            // Get user approval
+            let confirm = dialoguer::Confirm::new()
+                .with_prompt(format!("\n\nRun command: {}", command))
+                .default(false)
+                .interact()
+                .unwrap_or(false);
+
+            if confirm {
+                // Execute command and capture output
+                match ProcessCommand::new("sh")
+                    .arg("-c")
+                    .arg(command)
+                    .output() 
+                {
+                    Ok(output) => {
+                        let stdout = String::from_utf8_lossy(&output.stdout);
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        let result = format!("Command output:\nstdout:\n{}\nstderr:\n{}", stdout, stderr);
+                        println!(result);
+                        
+                        // Pass result back to AI
+                        let input = Value::String(result);
+                        perform_request(input, conversation_state, transcript_path, "");
+                    }
+                    Err(e) => {
+                        println!("Failed to execute command: {}", e);
+                        let input = Value::String(format!("Command failed: {}", e));
+                        perform_request(input, conversation_state, transcript_path, "");
+                    }
+                }
+            } else {
+                let input = Value::String("Command was rejected by user. Please suggest an alternative.".to_string());
+                perform_request(input, conversation_state, transcript_path, "");
+            }
+        }
+    }
 }
 
 fn delete_all_files(files: Vec<PathBuf>) {
