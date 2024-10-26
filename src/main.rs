@@ -348,6 +348,12 @@ fn handle_recursive_mode(
         let mut last_message = conversation_state.messages.last().unwrap();
         let mut response = last_message.content.as_str().unwrap_or("");
 
+        // Check if task is complete
+        if response.contains("DONE") {
+            println!("Task completed!");
+            break;
+        }
+
         // If the last message wasn't a command suggestion, ask for one
         if !response.contains("COMMAND:") {
             let input = Value::String(format!("Original task: {}. Suggest the next command to run. Format your response as: COMMAND: <command> followed by an explanation. Or say DONE if the task is complete.", user_input));
@@ -356,12 +362,12 @@ fn handle_recursive_mode(
             // Update response with new AI message
             last_message = conversation_state.messages.last().unwrap();
             response = last_message.content.as_str().unwrap_or("");
-        }
 
-        // Check if task is complete
-        if response.contains("DONE") {
-            println!("Task completed!");
-            break;
+            // If response is updated, we need to check for completion again
+            if response.contains("DONE") {
+                println!("Task completed!");
+                break;
+            }
         }
 
         // Extract command
