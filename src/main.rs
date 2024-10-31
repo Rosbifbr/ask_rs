@@ -403,8 +403,13 @@ fn handle_recursive_mode(
                     }
                 }
             } else {
+                let comment = dialoguer::Input::<String>::new()
+                    .with_prompt("Comment on the provided code")
+                    .interact()
+                    .unwrap_or_default();
+
                 let input = Value::String(
-                    "Command was rejected by user. Please suggest an alternative.".to_string(),
+                    format!("Command was rejected by user.\nFEEDBACK: {}\n\nPlease suggest an alternative.", comment).to_string(),
                 );
                 perform_request(input, conversation_state, transcript_path, "");
             }
