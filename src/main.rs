@@ -10,17 +10,6 @@ use std::os::unix::process;
 use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
 
-const MODEL: &str = "o1-mini";
-const HOST: &str = "api.openai.com";
-const ENDPOINT: &str = "/v1/chat/completions";
-const MAX_TOKENS: u32 = 2048;
-const TEMPERATURE: f64 = 0.6;
-const VISION_DETAIL: &str = "high";
-const TRANSCRIPT_NAME: &str = "gpt_transcript-";
-const CLIPBOARD_COMMAND_XORG: &str = "xclip -selection clipboard -t image/png -o";
-const CLIPBOARD_COMMAND_WAYLAND: &str = "wl-paste";
-const CLIPBOARD_COMMAND_UNSUPPORTED: &str = "UNSUPPORTED";
-
 #[derive(Serialize, Deserialize, Debug, Clone)] // Added Clone here
 struct Message {
     role: String,
@@ -33,8 +22,57 @@ struct ConversationState {
     messages: Vec<Message>,
 }
 
-fn get_api_key() -> String {
-    env::var("OPENAI_API_KEY").expect("OPENAI_API_KEY must be set")
+#[derive(Serialize, Deserialize, Debug)]
+struct Settings {
+    api_key_variable: String,
+    model: String,
+    host: String,
+    endpoint: String,
+    max_tokens: u32,
+    temperature: f64,
+    vision_detail: String,
+    transcript_name: String,
+    clipboard_command_xorg: String,
+    clipboard_command_wayland: String,
+    clipboard_command_unsupported: String,
+}
+
+fn get_settings() -> Settings {
+    //Define default constants
+    let default_settings = Settings {
+        model: "o1-mini".to_string(),
+        host: "api.openai.com".to_string(),
+        endpoint: "/v1/chat/completions".to_string(),
+        max_tokens: 2048,
+        temperature: 0.6,
+        vision_detail: "high".to_string(),
+        transcript_name: "gpt_transcript-".to_string(),
+        clipboard_command_xorg: "xclip -selection clipboard -t image/png -o".to_string(),
+        clipboard_command_wayland: "wl-paste".to_string(),
+        clipboard_command_unsupported: "UNSUPPORTED".to_string(),
+        api_key_variable: "OPENAI_API_KEY".to_string(),
+    };
+
+    //Try reading constants from file
+    let settings_path = env::var("HOME")
+        .map(|home| format!("{}/.config/ask.json", home))
+        .unwrap_or_else(|_| ".config/ask.json".to_string());
+    
+    match fs::read_to_string(&settings_path)
+        .map_err(|e| format!("Could not read file: {}", e))
+        .and_then(|contents| {
+            serde_json::from_str(&contents)
+                .map_err(|e| format!("Could not parse JSON: {}", e))
+        }) {
+        Ok(settings) => {
+            //println!("Using settings from: {}", &settings_path);
+            settings
+        }
+        Err(e) => {
+            println!("WARNING: Using default settings. Error: {}.", e);
+            default_settings
+        }
+    }
 }
 
 fn main() {
@@ -77,21 +115,23 @@ fn main() {
         )
         .get_matches();
 
-    let api_key = get_api_key();
+    let settings = get_settings();
+    let api_key = env::var(&settings.api_key_variable).expect("Missing API key!");
+
     if api_key.is_empty() {
         eprintln!("Missing API key! Set the OPENAI_API_KEY environment variable and try again.");
         std::process::exit(1);
     }
 
     let temp_dir = env::temp_dir();
-    let transcript_path = temp_dir.join(format!("{}{}", TRANSCRIPT_NAME, process::parent_id()));
+    let transcript_path = temp_dir.join(format!("{}{}", settings.transcript_name, process::parent_id()));
 
     let mut conversation_state = if transcript_path.exists() {
         let data = fs::read_to_string(&transcript_path).expect("Unable to read transcript file");
         serde_json::from_str(&data).expect("Unable to parse transcript JSON")
     } else {
         let initial_message = Message {
-            role: if MODEL.contains("o1-") {
+            role: if settings.model.contains("o1-") {
                 "user".to_string()
             } else {
                 "system".to_string()
@@ -101,7 +141,7 @@ fn main() {
             ),
         };
         ConversationState {
-            model: MODEL.to_string(),
+            model: settings.model.to_string(),
             messages: vec![initial_message],
         }
     };
@@ -135,10 +175,10 @@ fn main() {
     let input_string = input.to_string();
 
     if matches.get_flag("recursive") {
-        handle_recursive_mode(&mut conversation_state, &transcript_path, input_string);
+        handle_recursive_mode(&mut conversation_state, &transcript_path, input_string, &settings);
         return;
     } else if matches.get_flag("manage") && !matches.get_one::<String>("input").is_some() {
-        manage_ongoing_convos(&mut conversation_state, &transcript_path);
+        manage_ongoing_convos(&mut conversation_state, &transcript_path, &settings);
         return;
     } else if matches.get_flag("clear") && !matches.get_one::<String>("input").is_some() {
         clear_current_convo(&transcript_path);
@@ -151,9 +191,9 @@ fn main() {
     }
 
     // Handle image mode
-    let clipboard_command = detect_clipboard_command();
+    let clipboard_command = detect_clipboard_command(&settings);
     if matches.get_flag("image") {
-        add_image_to_pipeline(&mut input, &clipboard_command);
+        add_image_to_pipeline(&mut input, &clipboard_command, &settings);
     }
 
     if input.is_null() {
@@ -167,10 +207,11 @@ fn main() {
         &mut conversation_state,
         &transcript_path,
         &clipboard_command,
+        &settings,
     );
 }
 
-fn detect_clipboard_command() -> String {
+fn detect_clipboard_command(settings: &Settings) -> String {
     let output = ProcessCommand::new("ps")
         .arg("-A")
         .output()
@@ -178,16 +219,16 @@ fn detect_clipboard_command() -> String {
     let os_out = String::from_utf8_lossy(&output.stdout);
 
     if os_out.to_lowercase().contains("xorg") {
-        CLIPBOARD_COMMAND_XORG.to_string()
+        settings.clipboard_command_xorg.clone()
     } else if os_out.to_lowercase().contains("wayland") {
-        CLIPBOARD_COMMAND_WAYLAND.to_string()
+        settings.clipboard_command_wayland.clone()
     } else {
-        CLIPBOARD_COMMAND_UNSUPPORTED.to_string()
+        settings.clipboard_command_unsupported.clone()
     }
 }
 
-fn add_image_to_pipeline(input: &mut Value, clipboard_command: &str) {
-    if clipboard_command == CLIPBOARD_COMMAND_UNSUPPORTED {
+fn add_image_to_pipeline(input: &mut Value, clipboard_command: &str, settings: &Settings) {
+    if clipboard_command == settings.clipboard_command_unsupported {
         panic!("Unsupported OS/DE combination. Only Xorg and Wayland are supported.");
     }
 
@@ -209,7 +250,7 @@ fn add_image_to_pipeline(input: &mut Value, clipboard_command: &str) {
             "type": "image_url",
             "image_url": {
                 "url": format!("data:image/png;base64,{}", image_buffer),
-                "detail": VISION_DETAIL,
+                "detail": settings.vision_detail,
             }
         }
     ]);
@@ -221,7 +262,8 @@ fn perform_request(
     input: Value,
     conversation_state: &mut ConversationState,
     transcript_path: &PathBuf,
-    _clipboard_command: &str, // Prefixed with underscore to indicate intentional unused variable
+    _clipboard_command: &str,
+    settings: &Settings,
 ) {
     conversation_state.messages.push(Message {
         role: "user".to_string(),
@@ -235,14 +277,14 @@ fn perform_request(
     });
 
     if !conversation_state.model.contains("o1-") {
-        body["max_tokens"] = serde_json::json!(MAX_TOKENS);
-        body["temperature"] = serde_json::json!(TEMPERATURE);
+        body["max_tokens"] = serde_json::json!(settings.max_tokens);
+        body["temperature"] = serde_json::json!(settings.temperature);
     }
 
     let client = reqwest::blocking::Client::new();
     let res = client
-        .post(&format!("https://{}{}", HOST, ENDPOINT))
-        .header("Authorization", format!("Bearer {}", get_api_key()))
+        .post(&format!("https://{}{}", settings.host, settings.endpoint))
+        .header("Authorization", format!("Bearer {}", env::var(&settings.api_key_variable).unwrap()))
         .json(&body)
         .send();
 
@@ -342,6 +384,7 @@ fn handle_recursive_mode(
     conversation_state: &mut ConversationState,
     transcript_path: &PathBuf,
     user_input: String,
+    settings: &Settings,
 ) {
     loop {
         // Get last AI message to check if it's already a command
@@ -357,7 +400,7 @@ fn handle_recursive_mode(
         // If the last message wasn't a command suggestion, ask for one
         if !response.contains("COMMAND:") {
             let input = Value::String(format!("Original task: {}. Suggest the next command to run. Format your response as: COMMAND: <command> followed by an explanation. Or say DONE if the task is complete.", user_input));
-            perform_request(input, conversation_state, transcript_path, "");
+            perform_request(input, conversation_state, transcript_path, "", settings);
 
             // Update response with new AI message
             last_message = conversation_state.messages.last().unwrap();
@@ -394,12 +437,12 @@ fn handle_recursive_mode(
 
                         // Pass result back to AI
                         let input = Value::String(result);
-                        perform_request(input, conversation_state, transcript_path, "");
+                        perform_request(input, conversation_state, transcript_path, "", &settings);
                     }
                     Err(e) => {
                         println!("Failed to execute command: {}", e);
                         let input = Value::String(format!("Command failed: {}", e));
-                        perform_request(input, conversation_state, transcript_path, "");
+                        perform_request(input, conversation_state, transcript_path, "", &settings);
                     }
                 }
             } else {
@@ -411,7 +454,7 @@ fn handle_recursive_mode(
                 let input = Value::String(
                     format!("Command was rejected by user.\nFEEDBACK: {}\n\nPlease suggest an alternative.", comment).to_string(),
                 );
-                perform_request(input, conversation_state, transcript_path, "");
+                perform_request(input, conversation_state, transcript_path, "", &settings);
             }
         }
     }
@@ -440,7 +483,7 @@ fn delete_all_files(files: Vec<PathBuf>) {
     }
 }
 
-fn manage_ongoing_convos(current_convo: &mut ConversationState, current_transcript_path: &PathBuf) {
+fn manage_ongoing_convos(current_convo: &mut ConversationState, current_transcript_path: &PathBuf, settings: &Settings) {
     let transcript_folder = env::temp_dir();
     let entries = fs::read_dir(&transcript_folder).unwrap();
 
@@ -451,7 +494,7 @@ fn manage_ongoing_convos(current_convo: &mut ConversationState, current_transcri
             p.file_name()
                 .unwrap()
                 .to_string_lossy()
-                .starts_with(TRANSCRIPT_NAME)
+                .starts_with(&settings.transcript_name)
         })
         .collect();
 
