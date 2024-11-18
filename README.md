@@ -6,7 +6,8 @@ The script uses the newer chat API from OpenAI and is preconfigured to use the G
 ## Installation
 To use it on UNIX-based systems, all you need to do is to compile/download the binary and run
 ```bash
-cp ask /bin
+cargo build -r 
+sudo cp target/release/ask /bin/ask
 ```
 
 ## Usage and Examples
@@ -31,3 +32,5 @@ The operating principle is very simple. Call the program, wait for a response an
 `ask -i - Passes image on the clipboard to the model (Configure clipboard extraction command. Ask is configured to use xclip by default)`
 
 `cat some_file.c | ask "What does this code do?"` - Parses file then question passed as argument.
+
+ask -r - Enters interactive agent mode. The model will keep trying to follow your instructions in the shell until you kill it.
