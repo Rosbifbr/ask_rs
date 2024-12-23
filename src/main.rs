@@ -32,6 +32,7 @@ struct Settings {
     temperature: f64,
     vision_detail: String,
     transcript_name: String,
+    editor: String,
     clipboard_command_xorg: String,
     clipboard_command_wayland: String,
     clipboard_command_unsupported: String,
@@ -48,6 +49,7 @@ fn get_settings() -> Settings {
         temperature: 0.6,
         vision_detail: "high".to_string(),
         transcript_name: "gpt_transcript-".to_string(),
+        editor: "more".to_string(), //Generally available.
         clipboard_command_xorg: "xclip -selection clipboard -t image/png -o".to_string(),
         clipboard_command_wayland: "wl-paste".to_string(),
         clipboard_command_unsupported: "UNSUPPORTED".to_string(),
@@ -197,7 +199,7 @@ fn main() {
     }
 
     if input.is_null() {
-        show_history(&conversation_state);
+        show_history(&conversation_state, settings.editor.clone());
         return;
     }
 
@@ -341,7 +343,7 @@ fn clear_current_convo(transcript_path: &PathBuf) {
     }
 }
 
-fn show_history(conversation_state: &ConversationState) {
+fn show_history(conversation_state: &ConversationState, editor_command: String) {
     let tmp_dir = env::temp_dir();
     let tmp_path = tmp_dir.join("ask_hist");
 
@@ -366,9 +368,7 @@ fn show_history(conversation_state: &ConversationState) {
     }
 
     fs::write(&tmp_path, content).expect("Unable to write history file");
-
-    let editor = env::var("EDITOR").unwrap_or_else(|_| "more".to_string());
-    ProcessCommand::new(editor)
+    ProcessCommand::new(editor_command)
         .arg(&tmp_path)
         .status()
         .expect("Failed to open editor");
