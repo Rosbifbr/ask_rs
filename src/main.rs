@@ -35,6 +35,7 @@ struct Settings {
     clipboard_command_xorg: String,
     clipboard_command_wayland: String,
     clipboard_command_unsupported: String,
+    startup_message: String
 }
 
 fn get_settings() -> Settings {
@@ -51,6 +52,7 @@ fn get_settings() -> Settings {
         clipboard_command_wayland: "wl-paste".to_string(),
         clipboard_command_unsupported: "UNSUPPORTED".to_string(),
         api_key_variable: "OPENAI_API_KEY".to_string(),
+        startup_message: "You are ChatConcise, a very advanced LLM designed for experienced users. As ChatConcise you oblige to adhere to the following directives UNLESS overridden by the user:\nBe concise, proactive, helpful and efficient. Do not say anything more than what needed, but also, DON'T BE LAZY. Provide ONLY code when an implementation is needed. DO NOT USE MARKDOWN.".to_string(),
     };
 
     //Try reading constants from file
@@ -77,7 +79,7 @@ fn get_settings() -> Settings {
 
 fn main() {
     let matches = Command::new("ask")
-        .version("1.0")
+        .version("1.3")
         .author("Rodrigo Ourique")
         .about("Rust terminal LLM caller")
         .arg(
@@ -136,9 +138,7 @@ fn main() {
             } else {
                 "system".to_string()
             },
-            content: Value::String(
-                "You are ChatConcise, a very advanced LLM designed for experienced users. As ChatConcise you oblige to adhere to the following directives UNLESS overridden by the user:\nBe concise, proactive, helpful and efficient. Do not say anything more than what needed, but also, DON'T BE LAZY. Provide ONLY code when an implementation is needed. DO NOT USE MARKDOWN.".to_string(),
-            ),
+            content: settings.startup_message.clone().into(),
         };
         ConversationState {
             model: settings.model.to_string(),
@@ -238,7 +238,8 @@ fn add_image_to_pipeline(input: &mut Value, clipboard_command: &str, settings: &
         .output()
         .expect("Failed to execute clipboard command");
 
-    let image_buffer = base64::encode(&output.stdout);
+    use base64::Engine;
+    let image_buffer = base64::engine::general_purpose::STANDARD.encode(&output.stdout);
 
     let user_text = input.as_str().unwrap_or("");
     let new_input = serde_json::json!([
@@ -386,6 +387,9 @@ fn handle_recursive_mode(
     user_input: String,
     settings: &Settings,
 ) {
+    let input = Value::String(format!("You are entering 'recursive agent mode' with the following instruction: {}. Suggest the next command to run. Format your response as: COMMAND: <command> followed by an explanation. Or say DONE if the task is complete.", user_input));
+    perform_request(input, conversation_state, transcript_path, "", settings);
+
     loop {
         // Get last AI message to check if it's already a command
         let mut last_message = conversation_state.messages.last().unwrap();
@@ -397,9 +401,9 @@ fn handle_recursive_mode(
             break;
         }
 
-        // If the last message wasn't a command suggestion, ask for one
+        // If the last message wasn't a command suggestion, steer the LLM towards it;
         if !response.contains("COMMAND:") {
-            let input = Value::String(format!("Original task: {}. Suggest the next command to run. Format your response as: COMMAND: <command> followed by an explanation. Or say DONE if the task is complete.", user_input));
+            let input = Value::String(format!("Remember the original task: {}. Format your response ONLY as: COMMAND: <command> followed by an explanation. Or say DONE if the task is complete.", user_input));
             perform_request(input, conversation_state, transcript_path, "", settings);
 
             // Update response with new AI message
