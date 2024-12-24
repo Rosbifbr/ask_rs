@@ -112,6 +112,12 @@ fn main() {
                 .action(ArgAction::SetTrue),
         )
         .arg(
+            Arg::new("clear_all")
+                .short('C')
+                .help("Remove all chats")
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
             Arg::new("recursive")
                 .short('r')
                 .help("Interactive agent mode")
@@ -178,6 +184,23 @@ fn main() {
 
     if matches.get_flag("recursive") {
         handle_recursive_mode(&mut conversation_state, &transcript_path, input_string, &settings);
+        return;
+    } else if matches.get_flag("clear_all") {
+        let transcript_folder = env::temp_dir();
+        let entries = fs::read_dir(&transcript_folder).unwrap();
+
+        let files: Vec<PathBuf> = entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(&settings.transcript_name)
+            })
+            .collect();
+
+        delete_all_files(files);
         return;
     } else if matches.get_flag("manage") && !matches.get_one::<String>("input").is_some() {
         manage_ongoing_convos(&mut conversation_state, &transcript_path, &settings);
@@ -465,26 +488,15 @@ fn handle_recursive_mode(
 }
 
 fn delete_all_files(files: Vec<PathBuf>) {
-    // Delete all conversations
-    let confirm = dialoguer::Confirm::new()
-        .with_prompt("Are you sure you want to delete all conversations?")
-        .default(false)
-        .interact()
-        .unwrap_or(false);
-
-    if confirm {
-        let mut deleted_count = 0;
-        for file in &files {
-            if let Err(e) = fs::remove_file(file) {
-                eprintln!("Failed to delete {}: {}", file.display(), e);
-            } else {
-                deleted_count += 1;
-            }
+    let mut deleted_count = 0;
+    for file in &files {
+        if let Err(e) = fs::remove_file(file) {
+            eprintln!("Failed to delete {}: {}", file.display(), e);
+        } else {
+            deleted_count += 1;
         }
-        println!("Deleted {} conversation(s).", deleted_count);
-    } else {
-        println!("Operation cancelled.");
     }
+    println!("Deleted {} conversation(s).", deleted_count);
 }
 
 fn manage_ongoing_convos(current_convo: &mut ConversationState, current_transcript_path: &PathBuf, settings: &Settings) {
