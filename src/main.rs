@@ -36,7 +36,7 @@ struct Settings {
     clipboard_command_xorg: String,
     clipboard_command_wayland: String,
     clipboard_command_unsupported: String,
-    startup_message: String
+    startup_message: String,
 }
 
 fn get_settings() -> Settings {
@@ -61,12 +61,11 @@ fn get_settings() -> Settings {
     let settings_path = env::var("HOME")
         .map(|home| format!("{}/.config/ask.json", home))
         .unwrap_or_else(|_| ".config/ask.json".to_string());
-    
+
     match fs::read_to_string(&settings_path)
         .map_err(|e| format!("Could not read file: {}", e))
         .and_then(|contents| {
-            serde_json::from_str(&contents)
-                .map_err(|e| format!("Could not parse JSON: {}", e))
+            serde_json::from_str(&contents).map_err(|e| format!("Could not parse JSON: {}", e))
         }) {
         Ok(settings) => {
             //println!("Using settings from: {}", &settings_path);
@@ -123,6 +122,12 @@ fn main() {
                 .help("Interactive agent mode")
                 .action(ArgAction::SetTrue),
         )
+        .arg(
+            Arg::new("plain")
+                .short('p')
+                .help("Start conversation without system prompt")
+                .action(ArgAction::SetTrue),
+        )
         .get_matches();
 
     let settings = get_settings();
@@ -134,56 +139,75 @@ fn main() {
     }
 
     let temp_dir = env::temp_dir();
-    let transcript_path = temp_dir.join(format!("{}{}", settings.transcript_name, process::parent_id()));
+    let transcript_path = temp_dir.join(format!(
+        "{}{}",
+        settings.transcript_name,
+        process::parent_id()
+    ));
 
     let mut conversation_state = if transcript_path.exists() {
         let data = fs::read_to_string(&transcript_path).expect("Unable to read transcript file");
         serde_json::from_str(&data).expect("Unable to parse transcript JSON")
     } else {
-        let initial_message = Message {
-            role: if settings.model.contains("o1-") {
-                "user".to_string()
-            } else {
-                "system".to_string()
-            },
-            content: settings.startup_message.clone().into(),
-        };
-        ConversationState {
-            model: settings.model.to_string(),
-            messages: vec![initial_message],
+        if matches.get_flag("plain") {
+            ConversationState {
+                model: settings.model.to_string(),
+                messages: vec![],
+            }
+        } else {
+            let initial_message = Message {
+                role: if settings.model.contains("o1-") {
+                    "user".to_string()
+                } else {
+                    "system".to_string()
+                },
+                content: settings.startup_message.clone().into(),
+            };
+            ConversationState {
+                model: settings.model.to_string(),
+                messages: vec![initial_message],
+            }
         }
     };
 
-    // Determine if input is being piped and get full input
-    let input = if !atty::is(Stream::Stdin) {
-        // Read from stdin
+    // Get input from both stdin and arguments, combining them
+    let mut input_parts = Vec::new();
+
+    // Read from stdin if available
+    if !atty::is(Stream::Stdin) {
         let mut buffer = String::new();
         io::stdin()
             .read_to_string(&mut buffer)
             .expect("Failed to read from stdin");
-        if buffer.trim().is_empty() {
-            Value::Null
-        } else {
-            Value::String(buffer)
+        if !buffer.trim().is_empty() {
+            input_parts.push(buffer);
         }
-    } else if let Some(values) = matches.get_many::<String>("input") {
-        let input_str = values
-            .map(|s| s.as_str()) // Convert &String to &str
-            .collect::<Vec<&str>>() // Collect into Vec<&str>
-            .join(" "); // Join with spaces
-        if input_str.trim().is_empty() {
-            Value::Null
-        } else {
-            Value::String(input_str)
+    }
+
+    // Get input from arguments if available
+    if let Some(values) = matches.get_many::<String>("input") {
+        let input_str = values.map(|s| s.as_str()).collect::<Vec<&str>>().join(" ");
+        if !input_str.trim().is_empty() {
+            input_parts.push(input_str);
         }
-    } else {
+    }
+
+    // Combine inputs with newlines if both present
+    let input = if input_parts.is_empty() {
         Value::Null
+    } else {
+        Value::String(input_parts.join("\n"))
     };
     let mut input = input;
     let input_string = input.to_string();
 
     if matches.get_flag("recursive") {
-        handle_recursive_mode(&mut conversation_state, &transcript_path, input_string, &settings);
+        handle_recursive_mode(
+            &mut conversation_state,
+            &transcript_path,
+            input_string,
+            &settings,
+        );
         return;
     } else if matches.get_flag("clear_all") {
         let transcript_folder = env::temp_dir();
@@ -310,7 +334,10 @@ fn perform_request(
     let client = reqwest::blocking::Client::new();
     let res = client
         .post(&format!("https://{}{}", settings.host, settings.endpoint))
-        .header("Authorization", format!("Bearer {}", env::var(&settings.api_key_variable).unwrap()))
+        .header(
+            "Authorization",
+            format!("Bearer {}", env::var(&settings.api_key_variable).unwrap()),
+        )
         .json(&body)
         .send();
 
@@ -499,7 +526,11 @@ fn delete_all_files(files: Vec<PathBuf>) {
     println!("Deleted {} conversation(s).", deleted_count);
 }
 
-fn manage_ongoing_convos(current_convo: &mut ConversationState, current_transcript_path: &PathBuf, settings: &Settings) {
+fn manage_ongoing_convos(
+    current_convo: &mut ConversationState,
+    current_transcript_path: &PathBuf,
+    settings: &Settings,
+) {
     let transcript_folder = env::temp_dir();
     let entries = fs::read_dir(&transcript_folder).unwrap();
 
