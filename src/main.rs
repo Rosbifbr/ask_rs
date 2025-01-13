@@ -23,11 +23,20 @@ struct ConversationState {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-struct Settings {
-    api_key_variable: String,
+struct ProviderSettings {
     model: String,
     host: String,
     endpoint: String,
+    api_key_variable: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct Settings {
+    oai: Option<ProviderSettings>,
+    x: Option<ProviderSettings>,
+    ds: Option<ProviderSettings>,
+    gemini: Option<ProviderSettings>,
+    provider: String,
     max_tokens: u32,
     temperature: f64,
     vision_detail: String,
@@ -42,9 +51,16 @@ struct Settings {
 fn get_settings() -> Settings {
     //Define default constants
     let default_settings = Settings {
-        model: "o1-mini".to_string(),
-        host: "api.openai.com".to_string(),
-        endpoint: "/v1/chat/completions".to_string(),
+        oai: Some(ProviderSettings {
+            model: "o1-mini".to_string(),
+            host: "api.openai.com".to_string(),
+            endpoint: "/v1/chat/completions".to_string(),
+            api_key_variable: "OPENAI_API_KEY".to_string(),
+        }),
+        x: None,
+        ds: None,
+        gemini: None,
+        provider: "oai".to_string(),
         max_tokens: 2048,
         temperature: 0.6,
         vision_detail: "high".to_string(),
@@ -53,8 +69,7 @@ fn get_settings() -> Settings {
         clipboard_command_xorg: "xclip -selection clipboard -t image/png -o".to_string(),
         clipboard_command_wayland: "wl-paste".to_string(),
         clipboard_command_unsupported: "UNSUPPORTED".to_string(),
-        api_key_variable: "OPENAI_API_KEY".to_string(),
-        startup_message: "You are ChatConcise, a very advanced LLM designed for experienced users. As ChatConcise you oblige to adhere to the following directives UNLESS overridden by the user:\nBe concise, proactive, helpful and efficient. Do not say anything more than what needed, but also, DON'T BE LAZY. Provide ONLY code when an implementation is needed. DO NOT USE MARKDOWN.".to_string(),
+        startup_message: "You are ChatConcise, a very advanced LLM designed for experienced users. As ChatConcise you oblige to adhere to the following directives UNLESS overridden by the user:\nBe concise, proactive, helpful and efficient. Do not say anything more than what needed, but also, DON'T BE LAZY. If the user is asking for software, provide ONLY the code.".to_string(),
     };
 
     //Try reading constants from file
@@ -67,10 +82,7 @@ fn get_settings() -> Settings {
         .and_then(|contents| {
             serde_json::from_str(&contents).map_err(|e| format!("Could not parse JSON: {}", e))
         }) {
-        Ok(settings) => {
-            //println!("Using settings from: {}", &settings_path);
-            settings
-        }
+        Ok(settings) => settings,
         Err(e) => {
             println!("WARNING: Using default settings. Error: {}.", e);
             default_settings
@@ -131,10 +143,25 @@ fn main() {
         .get_matches();
 
     let settings = get_settings();
-    let api_key = env::var(&settings.api_key_variable).expect("Missing API key!");
+    let provider_settings = match settings.provider.as_str() {
+        "oai" => settings.oai.as_ref(),
+        "x" => settings.x.as_ref(),
+        "ds" => settings.ds.as_ref(),
+        "gemini" => settings.gemini.as_ref(),
+        _ => {
+            eprintln!("Invalid provider: {}", settings.provider);
+            std::process::exit(1);
+        }
+    }
+    .expect("Provider settings not found!");
+
+    let api_key = env::var(&provider_settings.api_key_variable).expect("Missing API key!");
 
     if api_key.is_empty() {
-        eprintln!("Missing API key! Set the OPENAI_API_KEY environment variable and try again.");
+        eprintln!(
+            "Missing API key! Set the {} environment variable and try again.",
+            provider_settings.api_key_variable
+        );
         std::process::exit(1);
     }
 
@@ -149,24 +176,21 @@ fn main() {
         let data = fs::read_to_string(&transcript_path).expect("Unable to read transcript file");
         serde_json::from_str(&data).expect("Unable to parse transcript JSON")
     } else {
-        if matches.get_flag("plain") {
-            ConversationState {
-                model: settings.model.to_string(),
-                messages: vec![],
-            }
-        } else {
-            let initial_message = Message {
-                role: if settings.model.contains("o1-") {
+        let initial_message = if !matches.get_flag("plain") {
+            Some(Message {
+                role: if provider_settings.model.contains("o1-") {
                     "user".to_string()
                 } else {
                     "system".to_string()
                 },
                 content: settings.startup_message.clone().into(),
-            };
-            ConversationState {
-                model: settings.model.to_string(),
-                messages: vec![initial_message],
-            }
+            })
+        } else {
+            None
+        };
+        ConversationState {
+            model: provider_settings.model.to_string(),
+            messages: initial_message.map_or(vec![], |msg| vec![msg]),
         }
     };
 
@@ -207,6 +231,7 @@ fn main() {
             &transcript_path,
             input_string,
             &settings,
+            &provider_settings,
         );
         return;
     } else if matches.get_flag("clear_all") {
@@ -257,6 +282,7 @@ fn main() {
         &transcript_path,
         &clipboard_command,
         &settings,
+        &provider_settings,
     );
 }
 
@@ -314,6 +340,7 @@ fn perform_request(
     transcript_path: &PathBuf,
     _clipboard_command: &str,
     settings: &Settings,
+    provider_settings: &ProviderSettings,
 ) {
     conversation_state.messages.push(Message {
         role: "user".to_string(),
@@ -323,20 +350,30 @@ fn perform_request(
     let mut body = serde_json::json!({
         "messages": conversation_state.messages,
         "model": conversation_state.model,
-        "user": whoami::username(),
     });
 
-    if !conversation_state.model.contains("o1-") {
+    if !provider_settings.model.contains("o1-") && !provider_settings.model.contains("gemini-") {
         body["max_tokens"] = serde_json::json!(settings.max_tokens);
         body["temperature"] = serde_json::json!(settings.temperature);
     }
 
+    if !provider_settings.model.contains("gemini-") {
+        body["user"] = serde_json::json!(whoami::username())
+    }
+
     let client = reqwest::blocking::Client::new();
     let res = client
-        .post(&format!("https://{}{}", settings.host, settings.endpoint))
+        .post(format!(
+            "https://{}{}",
+            provider_settings.host, provider_settings.endpoint
+        ))
+        .header("Content-Type", "application/json")
         .header(
             "Authorization",
-            format!("Bearer {}", env::var(&settings.api_key_variable).unwrap()),
+            format!(
+                "Bearer {}",
+                env::var(&provider_settings.api_key_variable).unwrap()
+            ),
         )
         .json(&body)
         .send();
@@ -436,9 +473,17 @@ fn handle_recursive_mode(
     transcript_path: &PathBuf,
     user_input: String,
     settings: &Settings,
+    provider_settings: &ProviderSettings,
 ) {
     let input = Value::String(format!("You are entering 'recursive agent mode' with the following instruction: {}. Suggest the next command to run. Format your response as: COMMAND: <command> followed by an explanation. Or say DONE if the task is complete.", user_input));
-    perform_request(input, conversation_state, transcript_path, "", settings);
+    perform_request(
+        input,
+        conversation_state,
+        transcript_path,
+        "",
+        settings,
+        provider_settings,
+    );
 
     loop {
         // Get last AI message to check if it's already a command
@@ -454,7 +499,14 @@ fn handle_recursive_mode(
         // If the last message wasn't a command suggestion, steer the LLM towards it;
         if !response.contains("COMMAND:") {
             let input = Value::String(format!("Remember the original task: {}. Format your response ONLY as: COMMAND: <command> followed by an explanation. Or say DONE if the task is complete.", user_input));
-            perform_request(input, conversation_state, transcript_path, "", settings);
+            perform_request(
+                input,
+                conversation_state,
+                transcript_path,
+                "",
+                settings,
+                provider_settings,
+            );
 
             // Update response with new AI message
             last_message = conversation_state.messages.last().unwrap();
@@ -491,12 +543,26 @@ fn handle_recursive_mode(
 
                         // Pass result back to AI
                         let input = Value::String(result);
-                        perform_request(input, conversation_state, transcript_path, "", &settings);
+                        perform_request(
+                            input,
+                            conversation_state,
+                            transcript_path,
+                            "",
+                            &settings,
+                            provider_settings,
+                        );
                     }
                     Err(e) => {
                         println!("Failed to execute command: {}", e);
                         let input = Value::String(format!("Command failed: {}", e));
-                        perform_request(input, conversation_state, transcript_path, "", &settings);
+                        perform_request(
+                            input,
+                            conversation_state,
+                            transcript_path,
+                            "",
+                            &settings,
+                            provider_settings,
+                        );
                     }
                 }
             } else {
@@ -508,7 +574,14 @@ fn handle_recursive_mode(
                 let input = Value::String(
                     format!("Command was rejected by user.\nFEEDBACK: {}\n\nPlease suggest an alternative.", comment).to_string(),
                 );
-                perform_request(input, conversation_state, transcript_path, "", &settings);
+                perform_request(
+                    input,
+                    conversation_state,
+                    transcript_path,
+                    "",
+                    &settings,
+                    provider_settings,
+                );
             }
         }
     }
