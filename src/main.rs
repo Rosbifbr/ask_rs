@@ -30,12 +30,11 @@ struct ProviderSettings {
     api_key_variable: String,
 }
 
+use std::collections::HashMap;
+
 #[derive(Serialize, Deserialize, Debug)]
 struct Settings {
-    oai: Option<ProviderSettings>,
-    x: Option<ProviderSettings>,
-    ds: Option<ProviderSettings>,
-    gemini: Option<ProviderSettings>,
+    providers: HashMap<String, ProviderSettings>,
     provider: String,
     max_tokens: u32,
     temperature: f64,
@@ -50,16 +49,16 @@ struct Settings {
 
 fn get_settings() -> Settings {
     //Define default constants
+    let mut default_providers = HashMap::new();
+    default_providers.insert("oai".to_string(), ProviderSettings {
+        model: "o1-mini".to_string(),
+        host: "api.openai.com".to_string(),
+        endpoint: "/v1/chat/completions".to_string(),
+        api_key_variable: "OPENAI_API_KEY".to_string(),
+    });
+
     let default_settings = Settings {
-        oai: Some(ProviderSettings {
-            model: "o1-mini".to_string(),
-            host: "api.openai.com".to_string(),
-            endpoint: "/v1/chat/completions".to_string(),
-            api_key_variable: "OPENAI_API_KEY".to_string(),
-        }),
-        x: None,
-        ds: None,
-        gemini: None,
+        providers: default_providers,
         provider: "oai".to_string(),
         max_tokens: 2048,
         temperature: 0.6,
@@ -143,17 +142,10 @@ fn main() {
         .get_matches();
 
     let settings = get_settings();
-    let provider_settings = match settings.provider.as_str() {
-        "oai" => settings.oai.as_ref(),
-        "x" => settings.x.as_ref(),
-        "ds" => settings.ds.as_ref(),
-        "gemini" => settings.gemini.as_ref(),
-        _ => {
-            eprintln!("Invalid provider: {}", settings.provider);
-            std::process::exit(1);
-        }
-    }
-    .expect("Provider settings not found!");
+    let provider_settings = settings.providers.get(&settings.provider).unwrap_or_else(|| {
+        eprintln!("Invalid provider: {}", settings.provider);
+        std::process::exit(1);
+    });
 
     let api_key = env::var(&provider_settings.api_key_variable).expect("Missing API key!");
 
