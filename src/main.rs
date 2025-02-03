@@ -460,6 +460,14 @@ fn horizontal_line(ch: char) -> String {
     ch.to_string().repeat(columns)
 }
 
+use serde_json::Value as JsonValue;
+#[derive(Deserialize)]
+struct LLMResponse {
+    command: Option<String>,
+    explanation: Option<String>,
+    complete: bool,
+}
+
 fn handle_recursive_mode(
     conversation_state: &mut ConversationState,
     transcript_path: &PathBuf,
@@ -467,7 +475,17 @@ fn handle_recursive_mode(
     settings: &Settings,
     provider_settings: &ProviderSettings,
 ) {
-    let input = Value::String(format!("You are entering 'recursive agent mode' with the following instruction: {}. Suggest the next command to run. Format your response as: COMMAND: <command> followed by an explanation. Or say DONE if the task is complete.", user_input));
+    let initial_prompt = format!(
+        "You are entering 'recursive agent mode' with the following instruction: {}. \
+Return a JSON object with the following keys: \
+- \"complete\": a boolean indicating if the task is finished, \
+- \"command\": a string with the command to run (if any), \
+- \"explanation\": a string explaining your suggestion. \
+Do not include ANY extra text, such as markdown code delimiters.",
+        user_input
+    );
+
+    let input = JsonValue::String(initial_prompt);
     perform_request(
         input,
         conversation_state,
@@ -478,19 +496,95 @@ fn handle_recursive_mode(
     );
 
     loop {
-        // Get last AI message to check if it's already a command
-        let mut last_message = conversation_state.messages.last().unwrap();
-        let mut response = last_message.content.as_str().unwrap_or("");
+        let last_message = conversation_state.messages.last().unwrap();
+        let response_str = last_message.content.as_str().unwrap_or("");
+        let llm_response: Result<LLMResponse, _> = serde_json::from_str(response_str);
 
-        // Check if task is complete
-        if response.contains("DONE") {
-            println!("Task completed!");
-            break;
-        }
+        if let Ok(parsed) = llm_response {
+            if parsed.complete {
+                println!("Task completed!");
+                break;
+            }
 
-        // If the last message wasn't a command suggestion, steer the LLM towards it;
-        if !response.contains("COMMAND:") {
-            let input = Value::String(format!("Remember the original task: {}. Format your response ONLY as: COMMAND: <command> followed by an explanation. Or say DONE if the task is complete.", user_input));
+            if let Some(command) = parsed.command {
+                let confirm = dialoguer::Confirm::new()
+                    .with_prompt(format!("\n\nRun command: {}", command))
+                    .default(false)
+                    .interact()
+                    .unwrap_or(false);
+
+                if confirm {
+                    match ProcessCommand::new("sh").arg("-c").arg(&command).output() {
+                        Ok(output) => {
+                            let stdout = String::from_utf8_lossy(&output.stdout);
+                            let stderr = String::from_utf8_lossy(&output.stderr);
+                            let result = format!(
+                                "Command output:\nstdout:\n{}\nstderr:\n{}",
+                                stdout, stderr
+                            );
+                            println!("{}", result);
+                            let input = JsonValue::String(result);
+                            perform_request(
+                                input,
+                                conversation_state,
+                                transcript_path,
+                                "",
+                                settings,
+                                provider_settings,
+                            );
+                        }
+                        Err(e) => {
+                            println!("Failed to execute command: {}", e);
+                            let input = JsonValue::String(format!("Command failed: {}", e));
+                            perform_request(
+                                input,
+                                conversation_state,
+                                transcript_path,
+                                "",
+                                settings,
+                                provider_settings,
+                            );
+                        }
+                    }
+                } else {
+                    let comment = dialoguer::Input::<String>::new()
+                        .with_prompt("Comment on the provided code")
+                        .interact()
+                        .unwrap_or_default();
+                    let input = JsonValue::String(format!(
+                        "Command was rejected by user.\nFEEDBACK: {}\n\nPlease suggest an alternative.",
+                        comment
+                    ));
+                    perform_request(
+                        input,
+                        conversation_state,
+                        transcript_path,
+                        "",
+                        settings,
+                        provider_settings,
+                    );
+                }
+            } else {
+                let input = JsonValue::String(format!(
+                    "Remember the original task: {}. Return only a JSON object with keys: \
+                    \"complete\", \"command\" (if any), and \"explanation\". Please provide a valid JSON response.",
+                    user_input
+                ));
+                perform_request(
+                    input,
+                    conversation_state,
+                    transcript_path,
+                    "",
+                    settings,
+                    provider_settings,
+                );
+            }
+        } else {
+            // If parsing fails, request a reformat.
+            let input = JsonValue::String(format!(
+                "The previous response was not valid JSON. Please return a JSON object with keys: \
+                \"complete\", \"command\" (if any), and \"explanation\"."
+            ));
             perform_request(
                 input,
                 conversation_state,
@@ -499,82 +593,6 @@ fn handle_recursive_mode(
                 settings,
                 provider_settings,
             );
-
-            // Update response with new AI message
-            last_message = conversation_state.messages.last().unwrap();
-            response = last_message.content.as_str().unwrap_or("");
-
-            // If response is updated, we need to check for completion again
-            if response.contains("DONE") {
-                println!("Task completed!");
-                break;
-            }
-        }
-
-        // Extract command
-        if let Some(cmd_start) = response.find("COMMAND:") {
-            let cmd_text = response[cmd_start..].lines().next().unwrap();
-            let command = cmd_text.trim_start_matches("COMMAND:").trim();
-
-            // Get user approval
-            let confirm = dialoguer::Confirm::new()
-                .with_prompt(format!("\n\nRun command: {}", command))
-                .default(false)
-                .interact()
-                .unwrap_or(false);
-
-            if confirm {
-                // Execute command and capture output
-                match ProcessCommand::new("sh").arg("-c").arg(command).output() {
-                    Ok(output) => {
-                        let stdout = String::from_utf8_lossy(&output.stdout);
-                        let stderr = String::from_utf8_lossy(&output.stderr);
-                        let result =
-                            format!("Command output:\nstdout:\n{}\nstderr:\n{}", stdout, stderr);
-                        println!("{}", result);
-
-                        // Pass result back to AI
-                        let input = Value::String(result);
-                        perform_request(
-                            input,
-                            conversation_state,
-                            transcript_path,
-                            "",
-                            &settings,
-                            provider_settings,
-                        );
-                    }
-                    Err(e) => {
-                        println!("Failed to execute command: {}", e);
-                        let input = Value::String(format!("Command failed: {}", e));
-                        perform_request(
-                            input,
-                            conversation_state,
-                            transcript_path,
-                            "",
-                            &settings,
-                            provider_settings,
-                        );
-                    }
-                }
-            } else {
-                let comment = dialoguer::Input::<String>::new()
-                    .with_prompt("Comment on the provided code")
-                    .interact()
-                    .unwrap_or_default();
-
-                let input = Value::String(
-                    format!("Command was rejected by user.\nFEEDBACK: {}\n\nPlease suggest an alternative.", comment).to_string(),
-                );
-                perform_request(
-                    input,
-                    conversation_state,
-                    transcript_path,
-                    "",
-                    &settings,
-                    provider_settings,
-                );
-            }
         }
     }
 }
