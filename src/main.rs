@@ -51,7 +51,7 @@ fn get_settings() -> Settings {
     //Define default constants
     let mut default_providers = HashMap::new();
     default_providers.insert("oai".to_string(), ProviderSettings {
-        model: "o1-mini".to_string(),
+        model: "o3-mini".to_string(),
         host: "api.openai.com".to_string(),
         endpoint: "/v1/chat/completions".to_string(),
         api_key_variable: "OPENAI_API_KEY".to_string(),
@@ -170,7 +170,7 @@ fn main() {
     } else {
         let initial_message = if !matches.get_flag("plain") {
             Some(Message {
-                role: if provider_settings.model.contains("o1-") {
+                role: if provider_settings.model.contains("o1-") || provider_settings.model.contains("o3-") {
                     "user".to_string()
                 } else {
                     "system".to_string()
@@ -285,10 +285,10 @@ fn detect_clipboard_command(settings: &Settings) -> String {
         .expect("Failed to execute ps command");
     let os_out = String::from_utf8_lossy(&output.stdout);
 
-    if os_out.to_lowercase().contains("xorg") {
-        settings.clipboard_command_xorg.clone()
-    } else if os_out.to_lowercase().contains("wayland") {
+    if os_out.to_lowercase().contains("wayland") {
         settings.clipboard_command_wayland.clone()
+    } else if os_out.to_lowercase().contains("xorg") {
+        settings.clipboard_command_xorg.clone()
     } else {
         settings.clipboard_command_unsupported.clone()
     }
@@ -304,6 +304,11 @@ fn add_image_to_pipeline(input: &mut Value, clipboard_command: &str, settings: &
         .arg(clipboard_command)
         .output()
         .expect("Failed to execute clipboard command");
+
+    if output.stdout.is_empty() {
+        eprintln!("Clipboard returned no data. Ensure an image is available on the clipboard. clipboard_command is '{}'", clipboard_command);
+        std::process::exit(1);
+    }
 
     use base64::Engine;
     let image_buffer = base64::engine::general_purpose::STANDARD.encode(&output.stdout);
@@ -344,7 +349,7 @@ fn perform_request(
         "model": conversation_state.model,
     });
 
-    if !provider_settings.model.contains("o1-") && !provider_settings.model.contains("gemini-") {
+    if !provider_settings.model.contains("o1-") && !provider_settings.model.contains("o3-") && !provider_settings.model.contains("gemini-") {
         body["max_tokens"] = serde_json::json!(settings.max_tokens);
         body["temperature"] = serde_json::json!(settings.temperature);
     }
@@ -481,6 +486,8 @@ Return a JSON object with the following keys: \
 - \"complete\": a boolean indicating if the task is finished, \
 - \"command\": a string with the command to run (if any), \
 - \"explanation\": a string explaining your suggestion. \
+You can use 'cat' to read files and 'echo' combined with 'cat' to edit files. \
+Remember: To edit any file, you must ALWAYS read the file with 'cat' first so that you do not hallucinate its contents. \
 Do not include ANY extra text, such as markdown code delimiters.",
         user_input
     );
