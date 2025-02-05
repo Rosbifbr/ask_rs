@@ -6,6 +6,7 @@ use serde_json::Value;
 use std::env;
 use std::fs;
 use std::io::{self, Read};
+use std::time::Duration;
 use std::os::unix::process;
 use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
@@ -16,7 +17,7 @@ struct Message {
     content: Value,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 struct ConversationState {
     model: String,
     messages: Vec<Message>,
@@ -358,7 +359,10 @@ fn perform_request(
         body["user"] = serde_json::json!(whoami::username())
     }
 
-    let client = reqwest::blocking::Client::new();
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()
+        .unwrap();
     let res = client
         .post(format!(
             "https://{}{}",
@@ -401,13 +405,49 @@ fn process_response(
                     .unwrap_or("")
                     .to_string();
 
-                println!("{}", content.as_str().unwrap_or(""));
+
+                let message_text = content.as_str().unwrap_or("");
+                if !message_text.contains("__recursive_command_ignore") {
+                    println!("{}", message_text);
+                }
 
                 let assistant_message = Message { role, content };
 
                 conversation_state.messages.push(assistant_message);
 
-                let conversation_json = serde_json::to_string(&conversation_state).unwrap();
+                // let conversation_json = serde_json::to_string(&conversation_state).unwrap();
+
+                // Create a truncated copy for the transcript focusing only on the last two messages.
+                let mut truncated_state = conversation_state.clone();
+                if truncated_state.messages.len() >= 2 {
+                    let indices = [truncated_state.messages.len() - 2, truncated_state.messages.len() - 1];
+                    let mut should_truncate = false;
+                    for &i in &indices {
+                        if let Some(text) = truncated_state.messages[i].content.as_str() {
+                            if text.len() > 5000 {
+                                should_truncate = true;
+                                break;
+                            }
+                        }
+                    }
+                    if should_truncate {
+                        let confirm = dialoguer::Confirm::new()
+                            .with_prompt("Your last message or assistant response was too large, recommend truncating history")
+                            .default(true)
+                            .interact()
+                            .unwrap_or(false);
+                        if confirm {
+                            for &i in &indices {
+                                if let Some(text) = truncated_state.messages[i].content.as_str() {
+                                    if text.len() > 5000 {
+                                        truncated_state.messages[i].content = serde_json::json!(format!("{} [truncated]", &text[..5000]));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                let conversation_json = serde_json::to_string(&truncated_state).unwrap();
                 fs::write(transcript_path, conversation_json)
                     .expect("Unable to write transcript file");
             }
@@ -486,9 +526,12 @@ Return a JSON object with the following keys: \
 - \"complete\": a boolean indicating if the task is finished, \
 - \"command\": a string with the command to run (if any), \
 - \"explanation\": a string explaining your suggestion. \
+- \"signature\": a string of value \"__recursive_command_ignore\" so that parsers can identify this as an agent instruction and not a chat item. \
 You can use 'cat' to read files and 'echo' combined with 'cat' to edit files. \
-Remember: To edit any file, you must ALWAYS read the file with 'cat' first so that you do not hallucinate its contents. \
-Do not include ANY extra text, such as markdown code delimiters.",
+Reminder 1: To edit any file, you must ALWAYS read the file with 'cat' first so that you do not hallucinate its contents. \
+Reminder 2: Prefer not to chain commands with && unless necessary, as it difficultates user review. \
+Reminder 3: DO NOT BE LAZY! You should do EVERYTHING for the user UNTIL the task is complete.
+Do not include ANY extra text in the response JSON, such as markdown delimiters.",
         user_input
     );
 
@@ -514,6 +557,7 @@ Do not include ANY extra text, such as markdown code delimiters.",
             }
 
             if let Some(command) = parsed.command {
+                println!("Explanation: {}", parsed.explanation.unwrap_or_default());
                 let confirm = dialoguer::Confirm::new()
                     .with_prompt(format!("\n\nRun command: {}", command))
                     .default(false)
