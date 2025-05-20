@@ -1,17 +1,19 @@
 use atty::Stream;
-use clap::{Arg, ArgAction, Command};
-use dialoguer::{theme::ColorfulTheme, Select};
+use clap::{Arg, ArgAction, Command as ClapCommand};
+use dialoguer::{theme::ColorfulTheme, Confirm, Input, Select};
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::env;
 use std::fs;
-use std::io::{self, Read};
-use std::time::Duration;
+use std::io::{self, Read, Write};
 use std::os::unix::process;
 use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
+use std::time::Duration; // Added import for Duration
 
-#[derive(Serialize, Deserialize, Debug, Clone)] // Added Clone here
+#[derive(Serialize, Deserialize, Debug, Clone)]
 struct Message {
     role: String,
     content: Value,
@@ -31,8 +33,6 @@ struct ProviderSettings {
     api_key_variable: String,
 }
 
-use std::collections::HashMap;
-
 #[derive(Serialize, Deserialize, Debug)]
 struct Settings {
     providers: HashMap<String, ProviderSettings>,
@@ -46,17 +46,29 @@ struct Settings {
     clipboard_command_wayland: String,
     clipboard_command_unsupported: String,
     startup_message: String,
+    recursive_mode_startup_prompt_template: String,
 }
 
 fn get_settings() -> Settings {
-    //Define default constants
     let mut default_providers = HashMap::new();
-    default_providers.insert("oai".to_string(), ProviderSettings {
-        model: "o3-mini".to_string(),
-        host: "api.openai.com".to_string(),
-        endpoint: "/v1/chat/completions".to_string(),
-        api_key_variable: "OPENAI_API_KEY".to_string(),
-    });
+    default_providers.insert(
+        "oai".to_string(),
+        ProviderSettings {
+            model: "gpt-4o-mini".to_string(),
+            host: "api.openai.com".to_string(),
+            endpoint: "/v1/chat/completions".to_string(),
+            api_key_variable: "OPENAI_API_KEY".to_string(),
+        },
+    );
+    default_providers.insert(
+        "gemini".to_string(),
+        ProviderSettings {
+            model: "gemini-1.5-flash-latest".to_string(),
+            host: "generativelanguage.googleapis.com".to_string(),
+            endpoint: "/v1beta/models/gemini-1.5-flash-latest:streamGenerateContent".to_string(),
+            api_key_variable: "GEMINI_API_KEY".to_string(),
+        },
+    );
 
     let default_settings = Settings {
         providers: default_providers,
@@ -65,14 +77,25 @@ fn get_settings() -> Settings {
         temperature: 0.6,
         vision_detail: "high".to_string(),
         transcript_name: "gpt_transcript-".to_string(),
-        editor: "more".to_string(), //Generally available.
+        editor: "more".to_string(),
         clipboard_command_xorg: "xclip -selection clipboard -t image/png -o".to_string(),
         clipboard_command_wayland: "wl-paste".to_string(),
         clipboard_command_unsupported: "UNSUPPORTED".to_string(),
         startup_message: "You are ChatConcise, a very advanced LLM designed for experienced users. As ChatConcise you oblige to adhere to the following directives UNLESS overridden by the user:\nBe concise, proactive, helpful and efficient. Do not say anything more than what needed, but also, DON'T BE LAZY. If the user is asking for software, provide ONLY the code.".to_string(),
+        recursive_mode_startup_prompt_template: "You are entering 'recursive agent mode' with the following instruction: {user_input}. \
+Return a JSON object with the following keys: \
+- \"complete\": a boolean indicating if the task is finished, \
+- \"command\": a string with the command to run (if any), \
+- \"explanation\": a string explaining your suggestion. \
+- \"signature\": a string of value \"__recursive_command_ignore\" so that parsers can identify this as an agent instruction and not a chat item. \
+You can use 'cat' to read files and 'echo' combined with 'cat' to edit files. \
+Reminder 1: To edit any file, you must ALWAYS read the file with 'cat' first so that you do not hallucinate its contents. \
+Reminder 2: Prefer not to chain commands with && unless necessary, as it difficultates user review. \
+Reminder 3: DO NOT BE LAZY! You should do EVERYTHING for the user UNTIL the task is complete. \
+Do not include ANY extra text in the response JSON, such as markdown delimiters."
+            .to_string(),
     };
 
-    //Try reading constants from file
     let settings_path = env::var("HOME")
         .map(|home| format!("{}/.config/ask.json", home))
         .unwrap_or_else(|_| ".config/ask.json".to_string());
@@ -90,14 +113,13 @@ fn get_settings() -> Settings {
     }
 }
 
-fn main() {
-    let matches = Command::new("ask")
-        .version("1.3")
+#[tokio::main]
+async fn main() {
+    let matches = ClapCommand::new("ask")
+        .version("1.4")
         .author("Rodrigo Ourique")
-        .about("Rust terminal LLM caller")
-        .arg(
-            Arg::new("input").help("Input values").num_args(0..), // Allow zero or more arguments
-        )
+        .about("Rust terminal LLM caller with streaming")
+        .arg(Arg::new("input").help("Input values").num_args(0..))
         .arg(
             Arg::new("image")
                 .short('i')
@@ -143,12 +165,20 @@ fn main() {
         .get_matches();
 
     let settings = get_settings();
-    let provider_settings = settings.providers.get(&settings.provider).unwrap_or_else(|| {
-        eprintln!("Invalid provider: {}", settings.provider);
-        std::process::exit(1);
-    });
+    let provider_settings = settings
+        .providers
+        .get(&settings.provider)
+        .unwrap_or_else(|| {
+            eprintln!("Invalid provider: {}", settings.provider);
+            std::process::exit(1);
+        });
 
-    let api_key = env::var(&provider_settings.api_key_variable).expect("Missing API key!");
+    let api_key = env::var(&provider_settings.api_key_variable).unwrap_or_else(|_| {
+        panic!(
+            "Missing API key environment variable: {}!",
+            provider_settings.api_key_variable
+        )
+    });
 
     if api_key.is_empty() {
         eprintln!(
@@ -170,12 +200,17 @@ fn main() {
         serde_json::from_str(&data).expect("Unable to parse transcript JSON")
     } else {
         let initial_message = if !matches.get_flag("plain") {
+            let role = if provider_settings.model.contains("gemini-") {
+                "user".to_string()
+            } else if provider_settings.model.contains("o1-")
+                || provider_settings.model.contains("o3-")
+            {
+                "user".to_string()
+            } else {
+                "system".to_string()
+            };
             Some(Message {
-                role: if provider_settings.model.contains("o1-") || provider_settings.model.contains("o3-") {
-                    "user".to_string()
-                } else {
-                    "system".to_string()
-                },
+                role,
                 content: settings.startup_message.clone().into(),
             })
         } else {
@@ -187,10 +222,7 @@ fn main() {
         }
     };
 
-    // Get input from both stdin and arguments, combining them
     let mut input_parts = Vec::new();
-
-    // Read from stdin if available
     if !atty::is(Stream::Stdin) {
         let mut buffer = String::new();
         io::stdin()
@@ -201,7 +233,6 @@ fn main() {
         }
     }
 
-    // Get input from arguments if available
     if let Some(values) = matches.get_many::<String>("input") {
         let input_str = values.map(|s| s.as_str()).collect::<Vec<&str>>().join(" ");
         if !input_str.trim().is_empty() {
@@ -209,40 +240,25 @@ fn main() {
         }
     }
 
-    // Combine inputs with newlines if both present
-    let input = if input_parts.is_empty() {
+    let mut input_value = if input_parts.is_empty() {
         Value::Null
     } else {
         Value::String(input_parts.join("\n"))
     };
-    let mut input = input;
-    let input_string = input.to_string();
+    let input_string_for_recursive = input_value.as_str().unwrap_or("").to_string();
 
     if matches.get_flag("recursive") {
         handle_recursive_mode(
             &mut conversation_state,
             &transcript_path,
-            input_string,
+            input_string_for_recursive,
             &settings,
             &provider_settings,
-        );
+        )
+        .await;
         return;
     } else if matches.get_flag("clear_all") {
-        let transcript_folder = env::temp_dir();
-        let entries = fs::read_dir(&transcript_folder).unwrap();
-
-        let files: Vec<PathBuf> = entries
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| {
-                p.file_name()
-                    .unwrap()
-                    .to_string_lossy()
-                    .starts_with(&settings.transcript_name)
-            })
-            .collect();
-
-        delete_all_files(files);
+        delete_all_files_action(&settings);
         return;
     } else if matches.get_flag("manage") && !matches.get_one::<String>("input").is_some() {
         manage_ongoing_convos(&mut conversation_state, &transcript_path, &settings);
@@ -252,31 +268,37 @@ fn main() {
         return;
     } else if matches.get_flag("last") && !matches.get_one::<String>("input").is_some() {
         if let Some(last_message) = conversation_state.messages.last() {
-            println!("{}", serde_json::to_string(&last_message.content).unwrap());
+            if let Ok(pretty_json) = serde_json::to_string_pretty(&last_message.content) {
+                println!("{}", pretty_json);
+            } else {
+                println!(
+                    "{}",
+                    serde_json::to_string(&last_message.content).unwrap_or_default()
+                );
+            }
         }
         return;
     }
 
-    // Handle image mode
     let clipboard_command = detect_clipboard_command(&settings);
     if matches.get_flag("image") {
-        add_image_to_pipeline(&mut input, &clipboard_command, &settings);
+        add_image_to_pipeline(&mut input_value, &clipboard_command, &settings);
     }
 
-    if input.is_null() {
+    if input_value.is_null() {
         show_history(&conversation_state, settings.editor.clone());
         return;
     }
 
-    // Default case: simple request
     perform_request(
-        input,
+        input_value,
         &mut conversation_state,
         &transcript_path,
-        &clipboard_command,
         &settings,
         &provider_settings,
-    );
+        false,
+    )
+    .await;
 }
 
 fn detect_clipboard_command(settings: &Settings) -> String {
@@ -297,7 +319,8 @@ fn detect_clipboard_command(settings: &Settings) -> String {
 
 fn add_image_to_pipeline(input: &mut Value, clipboard_command: &str, settings: &Settings) {
     if clipboard_command == settings.clipboard_command_unsupported {
-        panic!("Unsupported OS/DE combination. Only Xorg and Wayland are supported.");
+        eprintln!("Unsupported OS/DE combination for clipboard image. Only Xorg and Wayland are supported via predefined commands.");
+        std::process::exit(1);
     }
 
     let output = ProcessCommand::new("sh")
@@ -314,8 +337,8 @@ fn add_image_to_pipeline(input: &mut Value, clipboard_command: &str, settings: &
     use base64::Engine;
     let image_buffer = base64::engine::general_purpose::STANDARD.encode(&output.stdout);
 
-    let user_text = input.as_str().unwrap_or("");
-    let new_input = serde_json::json!([
+    let user_text = input.as_str().unwrap_or("").to_string();
+    let new_input_content = serde_json::json!([
         {
             "type": "text",
             "text": user_text,
@@ -329,98 +352,128 @@ fn add_image_to_pipeline(input: &mut Value, clipboard_command: &str, settings: &
         }
     ]);
 
-    *input = new_input;
+    *input = new_input_content;
 }
 
-fn perform_request(
+async fn perform_request(
     input: Value,
     conversation_state: &mut ConversationState,
     transcript_path: &PathBuf,
-    _clipboard_command: &str,
     settings: &Settings,
     provider_settings: &ProviderSettings,
+    suppress_stream_print: bool,
 ) {
     conversation_state.messages.push(Message {
         role: "user".to_string(),
         content: input,
     });
 
-    let mut body = serde_json::json!({
-        "messages": conversation_state.messages,
-        "model": conversation_state.model,
-    });
+    let request_body_json: Value;
 
-    if !provider_settings.model.contains("o1-") && !provider_settings.model.contains("o3-") && !provider_settings.model.contains("gemini-") {
-        body["max_tokens"] = serde_json::json!(settings.max_tokens);
-        body["temperature"] = serde_json::json!(settings.temperature);
+    if provider_settings.model.contains("gemini-") {
+        let gemini_messages: Vec<Value> = conversation_state
+            .messages
+            .iter()
+            .map(|msg| {
+                let role = match msg.role.as_str() {
+                    "system" => "user",
+                    "assistant" => "model",
+                    _ => msg.role.as_str(),
+                };
+                if msg.content.is_array() {
+                     let parts: Vec<Value> = msg.content.as_array().unwrap().iter().map(|part_val| {
+                        let part_type = part_val.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                        if part_type == "text" {
+                            serde_json::json!({"text": part_val.get("text").unwrap_or(&Value::Null).as_str().unwrap_or("")})
+                        } else if part_type == "image_url" {
+                            let image_url_obj = part_val.get("image_url").unwrap();
+                            let image_data_url = image_url_obj.get("url").unwrap().as_str().unwrap();
+                            let parts_split: Vec<&str> = image_data_url.splitn(2, ',').collect();
+                            let mime_type_part: Vec<&str> = parts_split.get(0).unwrap_or(&"data:image/png;base64").splitn(2, ':').collect::<Vec<&str>>().get(1).unwrap_or(&"image/png;base64").split(';').collect();
+                            let mime_type = mime_type_part[0];
+                            let base64_data = parts_split.get(1).unwrap_or(&"");
+
+                            serde_json::json!({
+                                "inlineData": {
+                                    "mimeType": mime_type,
+                                    "data": base64_data
+                                }
+                            })
+                        } else {
+                            Value::Null
+                        }
+                    }).filter(|p| !p.is_null()).collect();
+                    serde_json::json!({"role": role, "parts": parts})
+                } else {
+                    serde_json::json!({
+                        "role": role,
+                        "parts": [{"text": msg.content.as_str().unwrap_or("")}]
+                    })
+                }
+            })
+            .collect();
+
+        request_body_json = serde_json::json!({
+            "contents": gemini_messages,
+            "generationConfig": {
+                "maxOutputTokens": settings.max_tokens,
+                "temperature": settings.temperature,
+            }
+        });
+    } else {
+        let mut body = serde_json::json!({
+            "messages": conversation_state.messages,
+            "model": conversation_state.model,
+            "stream": true
+        });
+        if !provider_settings.model.contains("o1-") && !provider_settings.model.contains("o3-") {
+            body["max_tokens"] = serde_json::json!(settings.max_tokens);
+            body["temperature"] = serde_json::json!(settings.temperature);
+        }
+        body["user"] = serde_json::json!(whoami::username());
+        request_body_json = body;
     }
 
-    if !provider_settings.model.contains("gemini-") {
-        body["user"] = serde_json::json!(whoami::username())
-    }
-
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(60))
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(300))
         .build()
         .unwrap();
+
+    let api_key = env::var(&provider_settings.api_key_variable).unwrap();
+
     let res = client
         .post(format!(
             "https://{}{}",
             provider_settings.host, provider_settings.endpoint
         ))
         .header("Content-Type", "application/json")
-        .header(
-            "Authorization",
-            format!(
-                "Bearer {}",
-                env::var(&provider_settings.api_key_variable).unwrap()
-            ),
-        )
-        .json(&body)
-        .send();
+        .header("Authorization", format!("Bearer {}", api_key))
+        .json(&request_body_json)
+        .send()
+        .await;
 
     match res {
         Ok(response) => {
-            let data: Value = response.json().unwrap();
-            process_response(&data, conversation_state, transcript_path);
-        }
-        Err(e) => {
-            eprintln!("HTTP request error: {}", e);
-        }
-    }
-}
+            if response.status().is_success() {
+                let (assistant_role, assistant_content_full) =
+                    handle_stream(response, provider_settings, suppress_stream_print).await;
 
-fn process_response(
-    data: &Value,
-    conversation_state: &mut ConversationState,
-    transcript_path: &PathBuf,
-) {
-    if let Some(choices) = data.get("choices") {
-        if let Some(choice) = choices.get(0) {
-            if let Some(message) = choice.get("message") {
-                let content = message.get("content").unwrap_or(&Value::Null).clone();
-                let role = message
-                    .get("role")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-
-
-                let message_text = content.as_str().unwrap_or("");
-                if !message_text.contains("__recursive_command_ignore") {
-                    println!("{}", message_text);
+                if !suppress_stream_print && !assistant_content_full.is_empty() {
+                    println!();
                 }
 
-                let assistant_message = Message { role, content };
-
+                let assistant_message = Message {
+                    role: assistant_role,
+                    content: Value::String(assistant_content_full),
+                };
                 conversation_state.messages.push(assistant_message);
 
-                // let conversation_json = serde_json::to_string(&conversation_state).unwrap();
-
-                // Create a truncated copy for the transcript focusing only on the last two messages.
                 let mut truncated_state = conversation_state.clone();
                 if truncated_state.messages.len() >= 2 {
-                    let indices = [truncated_state.messages.len() - 2, truncated_state.messages.len() - 1];
+                    let indices = [
+                        truncated_state.messages.len() - 2,
+                        truncated_state.messages.len() - 1,
+                    ];
                     let mut should_truncate = false;
                     for &i in &indices {
                         if let Some(text) = truncated_state.messages[i].content.as_str() {
@@ -431,33 +484,180 @@ fn process_response(
                         }
                     }
                     if should_truncate {
-                        let confirm = dialoguer::Confirm::new()
-                            .with_prompt("Your last message or assistant response was too large, recommend truncating history")
+                        if Confirm::new()
+                            .with_prompt(
+                                "Your last message or assistant response was too large, recommend truncating history for this session?",
+                            )
                             .default(true)
                             .interact()
-                            .unwrap_or(false);
-                        if confirm {
+                            .unwrap_or(false)
+                        {
                             for &i in &indices {
                                 if let Some(text) = truncated_state.messages[i].content.as_str() {
                                     if text.len() > 5000 {
-                                        truncated_state.messages[i].content = serde_json::json!(format!("{} [truncated]", &text[..5000]));
+                                        truncated_state.messages[i].content =
+                                            serde_json::json!(format!("{} [truncated]", &text[..5000]));
                                     }
                                 }
                             }
                         }
                     }
                 }
-                let conversation_json = serde_json::to_string(&truncated_state).unwrap();
+                let conversation_json = serde_json::to_string_pretty(&truncated_state).unwrap();
                 fs::write(transcript_path, conversation_json)
                     .expect("Unable to write transcript file");
+            } else {
+                let status = response.status();
+                let error_body = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| "Failed to read error body".to_string());
+                eprintln!("API Error: {} - {}", status, error_body);
+                eprintln!(
+                    "Request body: {}",
+                    serde_json::to_string_pretty(&request_body_json).unwrap_or_default()
+                );
             }
         }
-    } else {
-        eprintln!(
-            "Error processing API return. Full response ahead:\n{}\n",
-            data
-        );
+        Err(e) => {
+            eprintln!("HTTP request error: {}", e);
+        }
     }
+}
+
+async fn handle_stream(
+    response: reqwest::Response,
+    provider_settings: &ProviderSettings,
+    suppress_print: bool,
+) -> (String, String) {
+    let mut stream = response.bytes_stream(); // Requires "stream" feature for reqwest
+    let mut full_content = String::new();
+    let mut role = if provider_settings.model.contains("gemini-") {
+        "model".to_string()
+    } else {
+        String::new()
+    };
+
+    let mut buffer = String::new();
+
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok(chunk) => {
+                // chunk here is of type bytes::Bytes
+                buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+                loop {
+                    if provider_settings.model.contains("gemini-") {
+                        if let Some(end_of_object_idx) = buffer.find("}\n") {
+                            let potential_json = &buffer[..=end_of_object_idx];
+                            if let Ok(value) = serde_json::from_str::<Value>(potential_json.trim())
+                            {
+                                if let Some(candidates) =
+                                    value.get("candidates").and_then(|c| c.as_array())
+                                {
+                                    for candidate in candidates {
+                                        if let Some(content) = candidate.get("content") {
+                                            if let Some(parts) =
+                                                content.get("parts").and_then(|p| p.as_array())
+                                            {
+                                                for part in parts {
+                                                    if let Some(text_delta) =
+                                                        part.get("text").and_then(|t| t.as_str())
+                                                    {
+                                                        if !suppress_print {
+                                                            print!("{}", text_delta);
+                                                            io::stdout().flush().unwrap();
+                                                        }
+                                                        full_content.push_str(text_delta);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                buffer.replace_range(..=end_of_object_idx, "");
+                                continue;
+                            } else {
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
+                    } else {
+                        // OpenAI SSE
+                        if let Some(newline_idx) = buffer.find('\n') {
+                            let line = buffer[..newline_idx + 1].to_string();
+                            buffer.replace_range(..newline_idx + 1, "");
+
+                            if line.starts_with("data: ") {
+                                let json_str = line["data: ".len()..].trim();
+                                if json_str == "[DONE]" {
+                                    // This comparison should be fine
+                                    if !suppress_print {
+                                        io::stdout().flush().unwrap();
+                                    }
+                                    if role.is_empty() {
+                                        role = "assistant".to_string();
+                                    }
+                                    return (role, full_content);
+                                }
+                                if !json_str.is_empty() {
+                                    match serde_json::from_str::<Value>(json_str) {
+                                        Ok(value) => {
+                                            if let Some(choices) =
+                                                value.get("choices").and_then(|c| c.as_array())
+                                            {
+                                                if let Some(choice) = choices.get(0) {
+                                                    if let Some(delta) = choice.get("delta") {
+                                                        if role.is_empty() {
+                                                            if let Some(r) = delta
+                                                                .get("role")
+                                                                .and_then(|r| r.as_str())
+                                                            {
+                                                                role = r.to_string();
+                                                            }
+                                                        }
+                                                        if let Some(content_delta) = delta
+                                                            .get("content")
+                                                            .and_then(|c| c.as_str())
+                                                        {
+                                                            if !suppress_print {
+                                                                print!("{}", content_delta);
+                                                                io::stdout().flush().unwrap();
+                                                            }
+                                                            full_content.push_str(content_delta);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Err(_e) => { /* eprintln!("Stream JSON parse error: {}", e); eprintln!("Problematic JSON: {}", json_str); */
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                if !suppress_print {
+                    eprintln!("\nStream error: {}", e);
+                }
+                break;
+            }
+        }
+    }
+
+    if !suppress_print {
+        io::stdout().flush().unwrap();
+    }
+    if role.is_empty() {
+        role = "assistant".to_string();
+    }
+    (role, full_content)
 }
 
 fn clear_current_convo(transcript_path: &PathBuf) {
@@ -470,28 +670,46 @@ fn clear_current_convo(transcript_path: &PathBuf) {
 fn show_history(conversation_state: &ConversationState, editor_command: String) {
     let tmp_dir = env::temp_dir();
     let tmp_path = tmp_dir.join("ask_hist");
-
-    let mut content = String::new();
+    let mut content_str = String::new();
 
     for message in &conversation_state.messages {
-        content.push_str("\n\n");
-        content.push_str(&horizontal_line('▃'));
-        content.push_str(&format!("▍{} ▐\n", message.role));
-        content.push_str(&horizontal_line('▀'));
-        content.push_str("\n");
+        content_str.push_str("\n\n");
+        content_str.push_str(&horizontal_line('▃'));
+        content_str.push_str(&format!("▍{} ▐\n", message.role));
+        content_str.push_str(&horizontal_line('▀'));
+        content_str.push_str("\n");
 
         if let Some(text) = message.content.as_str() {
-            content.push_str(text);
+            content_str.push_str(text);
         } else if let Some(array) = message.content.as_array() {
-            if let Some(first_item) = array.get(0) {
-                if let Some(text) = first_item.get("text").and_then(|v| v.as_str()) {
-                    content.push_str(text);
+            for item in array {
+                if let Some(item_type) = item.get("type").and_then(|v| v.as_str()) {
+                    if item_type == "text" {
+                        if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+                            content_str.push_str(text);
+                            content_str.push_str("\n");
+                        }
+                    } else if item_type == "image_url" {
+                        content_str.push_str("[Image content - not displayed in text history]\n");
+                        if let Some(image_url_val) =
+                            item.get("image_url").and_then(|v| v.get("url"))
+                        {
+                            if let Some(url_str) = image_url_val.as_str() {
+                                content_str.push_str(&format!(
+                                    "[Image URL (truncated): {}...]\n",
+                                    url_str.chars().take(70).collect::<String>()
+                                ));
+                            }
+                        }
+                    }
                 }
             }
+        } else {
+            content_str.push_str(&message.content.to_string());
         }
     }
 
-    fs::write(&tmp_path, content).expect("Unable to write history file");
+    fs::write(&tmp_path, content_str).expect("Unable to write history file");
     ProcessCommand::new(editor_command)
         .arg(&tmp_path)
         .status()
@@ -505,150 +723,185 @@ fn horizontal_line(ch: char) -> String {
     ch.to_string().repeat(columns)
 }
 
-use serde_json::Value as JsonValue;
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 struct LLMResponse {
     command: Option<String>,
     explanation: Option<String>,
     complete: bool,
+    signature: Option<String>,
 }
 
-fn handle_recursive_mode(
+async fn handle_recursive_mode(
     conversation_state: &mut ConversationState,
     transcript_path: &PathBuf,
     user_input: String,
     settings: &Settings,
     provider_settings: &ProviderSettings,
 ) {
-    let initial_prompt = format!(
-        "You are entering 'recursive agent mode' with the following instruction: {}. \
-Return a JSON object with the following keys: \
-- \"complete\": a boolean indicating if the task is finished, \
-- \"command\": a string with the command to run (if any), \
-- \"explanation\": a string explaining your suggestion. \
-- \"signature\": a string of value \"__recursive_command_ignore\" so that parsers can identify this as an agent instruction and not a chat item. \
-You can use 'cat' to read files and 'echo' combined with 'cat' to edit files. \
-Reminder 1: To edit any file, you must ALWAYS read the file with 'cat' first so that you do not hallucinate its contents. \
-Reminder 2: Prefer not to chain commands with && unless necessary, as it difficultates user review. \
-Reminder 3: DO NOT BE LAZY! You should do EVERYTHING for the user UNTIL the task is complete.
-Do not include ANY extra text in the response JSON, such as markdown delimiters.",
-        user_input
-    );
+    let initial_prompt = settings
+        .recursive_mode_startup_prompt_template
+        .replace("{user_input}", &user_input);
 
-    let input = JsonValue::String(initial_prompt);
     perform_request(
-        input,
+        Value::String(initial_prompt),
         conversation_state,
         transcript_path,
-        "",
         settings,
         provider_settings,
-    );
+        true,
+    )
+    .await;
 
     loop {
-        let last_message = conversation_state.messages.last().unwrap();
-        let response_str = last_message.content.as_str().unwrap_or("");
-        let llm_response: Result<LLMResponse, _> = serde_json::from_str(response_str);
+        let last_message = conversation_state.messages.last().cloned();
+        if last_message.is_none() {
+            println!("Error: No last message found in recursive mode. Exiting.");
+            break;
+        }
+        let last_message_content = last_message.unwrap().content;
 
-        if let Ok(parsed) = llm_response {
-            if parsed.complete {
-                println!("Task completed!");
-                break;
-            }
+        let response_str = last_message_content.as_str().unwrap_or("");
 
-            if let Some(command) = parsed.command {
-                println!("Explanation: {}", parsed.explanation.unwrap_or_default());
-                let confirm = dialoguer::Confirm::new()
-                    .with_prompt(format!("\n\nRun command: {}", command))
-                    .default(false)
-                    .interact()
-                    .unwrap_or(false);
+        match serde_json::from_str::<LLMResponse>(response_str) {
+            Ok(parsed) => {
+                if parsed.signature.as_deref() != Some("__recursive_command_ignore") {
+                    println!("LLM response did not contain the correct signature for recursive mode. Treating as a normal message.");
+                    println!("LLM Raw Response:\n{}", response_str);
+                    let user_feedback = Input::<String>::new()
+                        .with_prompt("The agent's response was not a valid command structure. Please provide feedback or a new instruction, or type 'exit' to quit recursive mode")
+                        .interact_text()
+                        .unwrap_or_else(|_| "exit".to_string());
 
-                if confirm {
-                    match ProcessCommand::new("sh").arg("-c").arg(&command).output() {
-                        Ok(output) => {
-                            let stdout = String::from_utf8_lossy(&output.stdout);
-                            let stderr = String::from_utf8_lossy(&output.stderr);
-                            let result = format!(
-                                "Command output:\nstdout:\n{}\nstderr:\n{}",
-                                stdout, stderr
-                            );
-                            println!("{}", result);
-                            let input = JsonValue::String(result);
-                            perform_request(
-                                input,
-                                conversation_state,
-                                transcript_path,
-                                "",
-                                settings,
-                                provider_settings,
-                            );
-                        }
-                        Err(e) => {
-                            println!("Failed to execute command: {}", e);
-                            let input = JsonValue::String(format!("Command failed: {}", e));
-                            perform_request(
-                                input,
-                                conversation_state,
-                                transcript_path,
-                                "",
-                                settings,
-                                provider_settings,
-                            );
-                        }
+                    if user_feedback.trim().to_lowercase() == "exit" {
+                        println!("Exiting recursive mode due to invalid response structure and user choice.");
+                        break;
                     }
-                } else {
-                    let comment = dialoguer::Input::<String>::new()
-                        .with_prompt("Comment on the provided code")
-                        .interact()
-                        .unwrap_or_default();
-                    let input = JsonValue::String(format!(
-                        "Command was rejected by user.\nFEEDBACK: {}\n\nPlease suggest an alternative.",
-                        comment
-                    ));
                     perform_request(
-                        input,
+                        Value::String(format!("User feedback on invalid structure: {}. Please remember the original task: {}. Adhere to the JSON output format with 'command', 'explanation', 'complete', and 'signature'.", user_feedback, user_input)),
                         conversation_state,
                         transcript_path,
-                        "",
                         settings,
                         provider_settings,
-                    );
+                        true,
+                    ).await;
+                    continue;
                 }
-            } else {
-                let input = JsonValue::String(format!(
-                    "Remember the original task: {}. Return only a JSON object with keys: \
-                    \"complete\", \"command\" (if any), and \"explanation\". Please provide a valid JSON response.",
-                    user_input
-                ));
+
+                if let Some(explanation) = parsed.explanation {
+                    println!("Explanation: {}", explanation);
+                }
+
+                if parsed.complete {
+                    println!("Task marked as complete by the agent!");
+                    break;
+                }
+
+                if let Some(command) = parsed.command {
+                    if Confirm::new()
+                        .with_prompt(format!("\nRun command: {}", command))
+                        .default(false)
+                        .interact()
+                        .unwrap_or(false)
+                    {
+                        match ProcessCommand::new("sh").arg("-c").arg(&command).output() {
+                            Ok(output) => {
+                                let stdout = String::from_utf8_lossy(&output.stdout);
+                                let stderr = String::from_utf8_lossy(&output.stderr);
+                                let result = format!(
+                                    "Command executed. Output:\nstdout:\n{}\nstderr:\n{}",
+                                    stdout, stderr
+                                );
+                                println!("{}", result);
+                                perform_request(
+                                    Value::String(result),
+                                    conversation_state,
+                                    transcript_path,
+                                    settings,
+                                    provider_settings,
+                                    true,
+                                )
+                                .await;
+                            }
+                            Err(e) => {
+                                let error_msg = format!("Failed to execute command: {}", e);
+                                println!("{}", error_msg);
+                                perform_request(
+                                    Value::String(error_msg),
+                                    conversation_state,
+                                    transcript_path,
+                                    settings,
+                                    provider_settings,
+                                    true,
+                                )
+                                .await;
+                            }
+                        }
+                    } else {
+                        let comment = Input::<String>::new()
+                            .with_prompt("Command rejected. Provide feedback for the agent, or type 'exit' to quit")
+                            .interact_text()
+                            .unwrap_or_default();
+
+                        if comment.trim().to_lowercase() == "exit" {
+                            println!("Exiting recursive mode.");
+                            break;
+                        }
+
+                        perform_request(
+                            Value::String(format!(
+                                "User rejected the command.\nFeedback: {}\nPlease suggest an alternative or ask for clarification. Original task: {}",
+                                comment, user_input
+                            )),
+                            conversation_state,
+                            transcript_path,
+                            settings,
+                            provider_settings,
+                            true,
+                        )
+                        .await;
+                    }
+                } else {
+                    println!("Agent did not provide a command and task is not complete. Requesting next step from agent.");
+                    perform_request(
+                        Value::String(format!(
+                            "No command was provided, but the task is not yet complete. Please provide the next command or ask for clarification. Remember the original task: {}. Ensure you provide a 'command' or set 'complete' to true.",
+                            user_input
+                        )),
+                        conversation_state,
+                        transcript_path,
+                        settings,
+                        provider_settings,
+                        true,
+                    )
+                    .await;
+                }
+            }
+            Err(e) => {
+                println!("Failed to parse LLM response in recursive mode: {}", e);
+                println!("LLM Raw Response:\n{}", response_str);
+                let user_feedback = Input::<String>::new()
+                    .with_prompt("The agent's response was not valid JSON. Please provide feedback or a new instruction, or type 'exit' to quit recursive mode")
+                    .interact_text()
+                    .unwrap_or_else(|_| "exit".to_string());
+
+                if user_feedback.trim().to_lowercase() == "exit" {
+                    println!("Exiting recursive mode due to parsing error and user choice.");
+                    break;
+                }
                 perform_request(
-                    input,
+                    Value::String(format!("User feedback on JSON parsing error: {}. Previous response was: '{}'. Please remember the original task: {}. Adhere to the JSON output format.", user_feedback, response_str, user_input)),
                     conversation_state,
                     transcript_path,
-                    "",
                     settings,
                     provider_settings,
-                );
+                    true,
+                ).await;
             }
-        } else {
-            // If parsing fails, request a reformat.
-            let input = JsonValue::String(format!(
-                "The previous response was not valid JSON. Please return a JSON object with keys: \
-                \"complete\", \"command\" (if any), and \"explanation\"."
-            ));
-            perform_request(
-                input,
-                conversation_state,
-                transcript_path,
-                "",
-                settings,
-                provider_settings,
-            );
         }
     }
 }
 
-fn delete_all_files(files: Vec<PathBuf>) {
+fn delete_files(files: Vec<PathBuf>) -> usize {
     let mut deleted_count = 0;
     for file in &files {
         if let Err(e) = fs::remove_file(file) {
@@ -657,25 +910,62 @@ fn delete_all_files(files: Vec<PathBuf>) {
             deleted_count += 1;
         }
     }
-    println!("Deleted {} conversation(s).", deleted_count);
+    deleted_count
+}
+
+fn delete_all_files_action(settings: &Settings) {
+    let transcript_folder = env::temp_dir();
+    if let Ok(entries) = fs::read_dir(&transcript_folder) {
+        let files_to_delete: Vec<PathBuf> = entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.is_file()
+                    && p.file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .starts_with(&settings.transcript_name)
+            })
+            .collect();
+
+        if files_to_delete.is_empty() {
+            println!("No conversation transcripts found to delete.");
+            return;
+        }
+
+        let deleted_count = delete_files(files_to_delete);
+        println!("Deleted {} conversation transcript(s).", deleted_count);
+    } else {
+        eprintln!(
+            "Could not read transcript directory: {}",
+            transcript_folder.display()
+        );
+    }
 }
 
 fn manage_ongoing_convos(
-    current_convo: &mut ConversationState,
+    current_convo: &mut ConversationState, // Corrected: typo was ¤t_convo
     current_transcript_path: &PathBuf,
     settings: &Settings,
 ) {
     let transcript_folder = env::temp_dir();
-    let entries = fs::read_dir(&transcript_folder).unwrap();
+    let entries = match fs::read_dir(&transcript_folder) {
+        Ok(e) => e,
+        Err(err) => {
+            eprintln!("Could not read transcript directory: {}", err);
+            return;
+        }
+    };
 
     let files: Vec<PathBuf> = entries
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .filter(|p| {
-            p.file_name()
-                .unwrap()
-                .to_string_lossy()
-                .starts_with(&settings.transcript_name)
+            p.is_file()
+                && p.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .starts_with(&settings.transcript_name)
         })
         .collect();
 
@@ -684,37 +974,33 @@ fn manage_ongoing_convos(
         return;
     }
 
-    // Prepare options for dialoguer
     let mut options: Vec<String> = files
         .iter()
         .map(|file| {
             let data = fs::read_to_string(file).unwrap_or_default();
-            let convo: ConversationState =
-                serde_json::from_str(&data).unwrap_or_else(|_| ConversationState {
-                    model: "".to_string(),
-                    messages: vec![],
-                });
-            let first_message = convo.messages.get(1); // Use get to avoid panicking
-            let content = if let Some(msg) = first_message {
-                msg.content.as_str().unwrap_or("")
-            } else {
-                ""
+            let convo_first_message_content = match serde_json::from_str::<ConversationState>(&data)
+            {
+                Ok(convo) => convo
+                    .messages
+                    .get(1)
+                    .and_then(|msg| msg.content.as_str())
+                    .unwrap_or("[Could not parse message content or not a string]")
+                    .lines()
+                    .next()
+                    .unwrap_or("[Empty first line]")
+                    .chars()
+                    .take(64)
+                    .collect::<String>(),
+                Err(_) => "[Error reading transcript content]".to_string(),
             };
             format!(
                 "{} => {}",
-                file.file_name().unwrap().to_string_lossy(),
-                content
-                    .lines()
-                    .next()
-                    .unwrap_or("")
-                    .chars()
-                    .take(64)
-                    .collect::<String>()
+                file.file_name().unwrap_or_default().to_string_lossy(),
+                convo_first_message_content
             )
         })
         .collect();
 
-    //Add special helper option
     options.insert(0, ">>> Delete All Conversations".to_string());
 
     let selection = Select::with_theme(&ColorfulTheme::default())
@@ -725,50 +1011,100 @@ fn manage_ongoing_convos(
 
     if let Ok(index) = selection {
         if index == 0 {
-            delete_all_files(files);
+            delete_all_files_action(settings);
+            if current_transcript_path.exists() {
+                let current_filename = current_transcript_path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy();
+                if files.iter().any(|f| {
+                    f.file_name().unwrap_or_default().to_string_lossy() == current_filename
+                }) {
+                    // Current convo was deleted
+                }
+            }
             return;
         }
 
-        let selected_file = &files[index - 1]; //First option is the special helper
+        let selected_file_index = index - 1;
+        if selected_file_index >= files.len() {
+            println!("Invalid selection.");
+            return;
+        }
+        let selected_file = &files[selected_file_index];
+
         let action = Select::with_theme(&ColorfulTheme::default())
-            .with_prompt("Choose an action")
+            .with_prompt(format!(
+                "Action for {}:",
+                selected_file
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+            ))
             .default(0)
             .items(&["Delete", "Copy to Current Conversation", "Cancel"])
             .interact();
 
         match action {
             Ok(0) => {
-                // Delete the selected conversation
                 if let Err(e) = fs::remove_file(selected_file) {
                     println!("Failed to delete conversation: {}", e);
                 } else {
-                    println!("Conversation deleted successfully.");
+                    println!(
+                        "Conversation {} deleted successfully.",
+                        selected_file.display()
+                    );
                 }
             }
             Ok(1) => {
-                // Copy the selected conversation to current conversation
                 let data = fs::read_to_string(selected_file).unwrap_or_default();
-                let convo_to_copy: ConversationState =
-                    serde_json::from_str(&data).unwrap_or_else(|_| ConversationState {
-                        model: "".to_string(),
-                        messages: vec![],
-                    });
+                match serde_json::from_str::<ConversationState>(&data) {
+                    Ok(convo_to_copy) => {
+                        if convo_to_copy.model != current_convo.model {
+                            // Corrected: current_convo
+                            println!(
+                                "Cannot copy conversation: Model mismatch (current: {}, selected: {}).",
+                                current_convo.model, convo_to_copy.model // Corrected: current_convo
+                            );
+                            return;
+                        }
+                        let current_messages_is_empty = current_convo.messages.is_empty(); // Evaluate before closure
+                        let messages_to_add =
+                            convo_to_copy.messages.into_iter().skip_while(|msg| {
+                                !current_messages_is_empty
+                                    && (msg.role == "system"
+                                        || (msg
+                                            .content
+                                            .as_str()
+                                            .map_or(false, |s| s == settings.startup_message)))
+                            });
+                        current_convo.messages.extend(messages_to_add);
 
-                if convo_to_copy.model != current_convo.model {
-                    println!("Cannot copy conversation: Model mismatch.");
-                    return;
+                        match serde_json::to_string_pretty(current_convo) {
+                            Ok(conversation_json) => {
+                                if let Err(e) =
+                                    fs::write(current_transcript_path, conversation_json)
+                                {
+                                    eprintln!("Unable to write updated transcript file: {}", e);
+                                } else {
+                                    println!(
+                                        "Conversation copied to current session successfully."
+                                    );
+                                }
+                            }
+                            Err(e) => eprintln!("Could not serialize conversation to JSON: {}", e),
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "Could not parse selected conversation file {}: {}",
+                            selected_file.display(),
+                            e
+                        );
+                    }
                 }
-
-                current_convo
-                    .messages
-                    .extend(convo_to_copy.messages.iter().skip(1).cloned()); // Skip initial message
-                let conversation_json = serde_json::to_string(&current_convo).unwrap();
-                fs::write(current_transcript_path, conversation_json)
-                    .expect("Unable to write transcript file");
-                println!("Conversation copied successfully.");
             }
             _ => {
-                // Cancelled
                 println!("Action cancelled.");
             }
         }
