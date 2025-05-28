@@ -16,3 +16,4 @@ atty = "0.2"
 dialoguer = "0.10"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] } # Added tokio for async runtime
 bytes = "1" # Added bytes, as reqwest::Bytes (from stream) comes from this```
+regex = "1.11.1"

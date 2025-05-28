@@ -2,6 +2,7 @@ use atty::Stream;
 use clap::{Arg, ArgAction, Command as ClapCommand};
 use dialoguer::{theme::ColorfulTheme, Confirm, Input, Select};
 use futures_util::StreamExt;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -83,16 +84,25 @@ fn get_settings() -> Settings {
         clipboard_command_unsupported: "UNSUPPORTED".to_string(),
         startup_message: "You are ChatConcise, a very advanced LLM designed for experienced users. As ChatConcise you oblige to adhere to the following directives UNLESS overridden by the user:\nBe concise, proactive, helpful and efficient. Do not say anything more than what needed, but also, DON'T BE LAZY. If the user is asking for software, provide ONLY the code.".to_string(),
         recursive_mode_startup_prompt_template: "You are entering 'recursive agent mode' with the following instruction: {user_input}. \
-Return a JSON object with the following keys: \
-- \"complete\": a boolean indicating if the task is finished, \
-- \"command\": a string with the command to run (if any), \
-- \"explanation\": a string explaining your suggestion. \
-- \"signature\": a string of value \"__recursive_command_ignore\" so that parsers can identify this as an agent instruction and not a chat item. \
-You can use 'cat' to read files and 'echo' combined with 'cat' to edit files. \
-Reminder 1: To edit any file, you must ALWAYS read the file with 'cat' first so that you do not hallucinate its contents. \
+        You can respond in one of two key-value formats, with each key on a new line:\
+        \
+        1. To suggest a command to run:\
+        signature: __recursive_command_ignore\
+        complete: <true or false>\
+        command: <command to run, if any>\
+        explanation: <explanation of your suggestion>\
+        \
+        2. To ask the user for more information or provide context before proceeding:\
+        signature: __recursive_prompt_user\
+        complete: <true or false>\
+        prompt: <question or information for the user>\
+        explanation: <explanation of your suggestion>\
+        \
+        You can use 'cat file' to read files and 'echo *text* > file' to write to files. Remember to always write the full file. \
+        Reminder 1: To edit any file, you must ALWAYS read the file with 'cat' first so that you do not halluculate its contents. \
 Reminder 2: Prefer not to chain commands with && unless necessary, as it difficultates user review. \
 Reminder 3: DO NOT BE LAZY! You should do EVERYTHING for the user UNTIL the task is complete. \
-Do not include ANY extra text in the response JSON, such as markdown delimiters."
+Do not include ANY extra text or markdown delimiters."
             .to_string(),
     };
 
@@ -445,16 +455,22 @@ async fn perform_request(
 
     let api_key = env::var(&provider_settings.api_key_variable).unwrap();
 
-    let res = client
+    let request_builder = client
         .post(format!(
             "https://{}{}",
             provider_settings.host, provider_settings.endpoint
         ))
         .header("Content-Type", "application/json")
-        .header("Authorization", format!("Bearer {}", api_key))
-        .json(&request_body_json)
-        .send()
-        .await;
+        .json(&request_body_json);
+
+    let res = if provider_settings.model.contains("gemini-") {
+        request_builder.query(&[("key", api_key)]).send().await
+    } else {
+        request_builder
+            .header("Authorization", format!("Bearer {}", api_key))
+            .send()
+            .await
+    };
 
     match res {
         Ok(response) => {
@@ -766,48 +782,49 @@ async fn handle_recursive_mode(
 
         let response_str = last_message_content.as_str().unwrap_or("");
 
-        match serde_json::from_str::<LLMResponse>(response_str) {
-            Ok(parsed) => {
-                if parsed.signature.as_deref() != Some("__recursive_command_ignore") {
-                    println!("LLM response did not contain the correct signature for recursive mode. Treating as a normal message.");
-                    println!("LLM Raw Response:\n{}", response_str);
-                    let user_feedback = Input::<String>::new()
-                        .with_prompt("The agent's response was not a valid command structure. Please provide feedback or a new instruction, or type 'exit' to quit recursive mode")
-                        .interact_text()
-                        .unwrap_or_else(|_| "exit".to_string());
+        let mut signature: Option<String> = None;
+        let mut complete: bool = false;
+        let mut command: Option<String> = None;
+        let mut explanation: Option<String> = None;
 
-                    if user_feedback.trim().to_lowercase() == "exit" {
-                        println!("Exiting recursive mode due to invalid response structure and user choice.");
-                        break;
-                    }
-                    perform_request(
-                        Value::String(format!("User feedback on invalid structure: {}. Please remember the original task: {}. Adhere to the JSON output format with 'command', 'explanation', 'complete', and 'signature'.", user_feedback, user_input)),
-                        conversation_state,
-                        transcript_path,
-                        settings,
-                        provider_settings,
-                        true,
-                    ).await;
-                    continue;
+        for line in response_str.lines() {
+            let parts: Vec<&str> = line.splitn(2, ":").collect();
+            if parts.len() == 2 {
+                let key = parts[0].trim();
+                let value = parts[1].trim();
+                match key {
+                    "signature" => signature = Some(value.to_string()),
+                    "complete" => complete = value.to_lowercase() == "true",
+                    "command" => command = Some(value.to_string()),
+                    "explanation" => explanation = Some(value.to_string()),
+                    _ => {}
+                }
+            }
+        }
+
+        match signature.as_deref() {
+            Some("__recursive_command_ignore") => {
+                if let Some(explanation_text) = explanation {
+                    println!("Explanation: {}", explanation_text);
                 }
 
-                if let Some(explanation) = parsed.explanation {
-                    println!("Explanation: {}", explanation);
-                }
-
-                if parsed.complete {
+                if complete {
                     println!("Task marked as complete by the agent!");
                     break;
                 }
 
-                if let Some(command) = parsed.command {
+                if let Some(command_text) = command {
                     if Confirm::new()
-                        .with_prompt(format!("\nRun command: {}", command))
+                        .with_prompt(format!("\nRun command: {}", command_text))
                         .default(false)
                         .interact()
                         .unwrap_or(false)
                     {
-                        match ProcessCommand::new("sh").arg("-c").arg(&command).output() {
+                        match ProcessCommand::new("sh")
+                            .arg("-c")
+                            .arg(&command_text)
+                            .output()
+                        {
                             Ok(output) => {
                                 let stdout = String::from_utf8_lossy(&output.stdout);
                                 let stderr = String::from_utf8_lossy(&output.stderr);
@@ -842,7 +859,9 @@ async fn handle_recursive_mode(
                         }
                     } else {
                         let comment = Input::<String>::new()
-                            .with_prompt("Command rejected. Provide feedback for the agent, or type 'exit' to quit")
+                            .with_prompt(
+                                "Command rejected. Provide feedback for the agent, or type 'exit' to quit",
+                            )
                             .interact_text()
                             .unwrap_or_default();
 
@@ -880,20 +899,74 @@ async fn handle_recursive_mode(
                     .await;
                 }
             }
-            Err(e) => {
-                println!("Failed to parse LLM response in recursive mode: {}", e);
+            Some("__recursive_prompt_user") => {
+                if let Some(prompt_text) = explanation {
+                    // Using explanation for prompt text
+                    println!("Agent needs more information:");
+                    println!("{}", prompt_text);
+
+                    let user_response = Input::<String>::new()
+                        .with_prompt("Your response:")
+                        .interact_text()
+                        .unwrap_or_default();
+
+                    if user_response.trim().to_lowercase() == "exit" {
+                        println!("Exiting recursive mode.");
+                        break;
+                    }
+
+                    perform_request(
+                        Value::String(format!(
+                            "User provided information: {}. Continue with the original task: {}.",
+                            user_response, user_input
+                        )),
+                        conversation_state,
+                        transcript_path,
+                        settings,
+                        provider_settings,
+                        true,
+                    )
+                    .await;
+                } else {
+                    println!("Agent used __recursive_prompt_user signature but did not provide a prompt in the explanation field. Treating as a normal message.");
+                    println!("LLM Raw Response:\n{}", response_str);
+                    let user_feedback = Input::<String>::new()
+                        .with_prompt("The agent's response was not a valid prompt structure. Please provide feedback or a new instruction, or type 'exit' to quit recursive mode")
+                        .interact_text()
+                        .unwrap_or_else(|_| "exit".to_string());
+
+                    if user_feedback.trim().to_lowercase() == "exit" {
+                        println!(
+                            "Exiting recursive mode due to invalid response structure and user choice."
+                        );
+                        break;
+                    }
+                    perform_request(
+                        Value::String(format!("User feedback on invalid prompt structure: {}. Please remember the original task: {}. Adhere to the key-value output format with 'prompt' in the explanation field and 'signature' as __recursive_prompt_user.", user_feedback, user_input)),
+                        conversation_state,
+                        transcript_path,
+                        settings,
+                        provider_settings,
+                        true,
+                    ).await;
+                }
+            }
+            _ => {
+                println!("LLM response did not contain a recognized signature for recursive mode. Treating as a normal message.");
                 println!("LLM Raw Response:\n{}", response_str);
                 let user_feedback = Input::<String>::new()
-                    .with_prompt("The agent's response was not valid JSON. Please provide feedback or a new instruction, or type 'exit' to quit recursive mode")
+                    .with_prompt("The agent's response was not a valid command or prompt structure. Please provide feedback or a new instruction, or type 'exit' to quit recursive mode")
                     .interact_text()
                     .unwrap_or_else(|_| "exit".to_string());
 
                 if user_feedback.trim().to_lowercase() == "exit" {
-                    println!("Exiting recursive mode due to parsing error and user choice.");
+                    println!(
+                        "Exiting recursive mode due to invalid response structure and user choice."
+                    );
                     break;
                 }
                 perform_request(
-                    Value::String(format!("User feedback on JSON parsing error: {}. Previous response was: '{}'. Please remember the original task: {}. Adhere to the JSON output format.", user_feedback, response_str, user_input)),
+                    Value::String(format!("User feedback on invalid structure: {}. Please remember the original task: {}. Adhere to the key-value output format with 'command' or 'prompt' and a recognized 'signature'.", user_feedback, user_input)),
                     conversation_state,
                     transcript_path,
                     settings,
