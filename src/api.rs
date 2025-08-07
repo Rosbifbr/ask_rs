@@ -101,11 +101,17 @@ pub async fn perform_request(
 
     let api_key = env::var(&provider_settings.api_key_variable).unwrap();
 
+    let endpoint = if provider_settings.model.contains("gemini-") {
+        format!(
+            "/v1beta/models/{}:streamGenerateContent?alt=sse",
+            provider_settings.model
+        )
+    } else {
+        provider_settings.endpoint.clone()
+    };
+
     let request_builder = client
-        .post(format!(
-            "https://{}{}",
-            provider_settings.host, provider_settings.endpoint
-        ))
+        .post(format!("https://{}{}", provider_settings.host, endpoint))
         .header("Content-Type", "application/json")
         .json(&request_body_json);
 
@@ -213,63 +219,56 @@ async fn handle_stream(
                 buffer.push_str(&String::from_utf8_lossy(&chunk));
 
                 loop {
-                    if provider_settings.model.contains("gemini-") {
-                        if let Some(end_of_object_idx) = buffer.find("}\n") {
-                            let potential_json = &buffer[..=end_of_object_idx];
-                            if let Ok(value) = serde_json::from_str::<Value>(potential_json.trim())
-                            {
-                                if let Some(candidates) =
-                                    value.get("candidates").and_then(|c| c.as_array())
-                                {
-                                    for candidate in candidates {
-                                        if let Some(content) = candidate.get("content") {
-                                            if let Some(parts) =
-                                                content.get("parts").and_then(|p| p.as_array())
+                    if let Some(newline_idx) = buffer.find('\n') {
+                        let line = buffer[..newline_idx + 1].to_string();
+                        buffer.replace_range(..newline_idx + 1, "");
+
+                        if line.starts_with("data: ") {
+                            let json_str = line["data: ".len()..].trim();
+                            if json_str == "[DONE]" {
+                                if !suppress_print {
+                                    io::stdout().flush().unwrap();
+                                }
+                                if role.is_empty() {
+                                    role = if provider_settings.model.contains("gemini-") {
+                                        "model".to_string()
+                                    } else {
+                                        "assistant".to_string()
+                                    };
+                                }
+                                return (role, full_content);
+                            }
+                            if !json_str.is_empty() {
+                                match serde_json::from_str::<Value>(json_str) {
+                                    Ok(value) => {
+                                        if provider_settings.model.contains("gemini-") {
+                                            if let Some(candidates) =
+                                                value.get("candidates").and_then(|c| c.as_array())
                                             {
-                                                for part in parts {
-                                                    if let Some(text_delta) =
-                                                        part.get("text").and_then(|t| t.as_str())
-                                                    {
-                                                        if !suppress_print {
-                                                            print!("{}", text_delta);
-                                                            io::stdout().flush().unwrap();
+                                                for candidate in candidates {
+                                                    if let Some(content) = candidate.get("content") {
+                                                        if let Some(parts) = content
+                                                            .get("parts")
+                                                            .and_then(|p| p.as_array())
+                                                        {
+                                                            for part in parts {
+                                                                if let Some(text_delta) = part
+                                                                    .get("text")
+                                                                    .and_then(|t| t.as_str())
+                                                                {
+                                                                    if !suppress_print {
+                                                                        print!("{}", text_delta);
+                                                                        io::stdout().flush().unwrap();
+                                                                    }
+                                                                    full_content
+                                                                        .push_str(text_delta);
+                                                                }
+                                                            }
                                                         }
-                                                        full_content.push_str(text_delta);
                                                     }
                                                 }
                                             }
-                                        }
-                                    }
-                                }
-                                buffer.replace_range(..=end_of_object_idx, "");
-                                continue;
-                            } else {
-                                break;
-                            }
-                        } else {
-                            break;
-                        }
-                    } else {
-                        // OpenAI SSE
-                        if let Some(newline_idx) = buffer.find('\n') {
-                            let line = buffer[..newline_idx + 1].to_string();
-                            buffer.replace_range(..newline_idx + 1, "");
-
-                            if line.starts_with("data: ") {
-                                let json_str = line["data: ".len()..].trim();
-                                if json_str == "[DONE]" {
-                                    // This comparison should be fine
-                                    if !suppress_print {
-                                        io::stdout().flush().unwrap();
-                                    }
-                                    if role.is_empty() {
-                                        role = "assistant".to_string();
-                                    }
-                                    return (role, full_content);
-                                }
-                                if !json_str.is_empty() {
-                                    match serde_json::from_str::<Value>(json_str) {
-                                        Ok(value) => {
+                                        } else {
                                             if let Some(choices) =
                                                 value.get("choices").and_then(|c| c.as_array())
                                             {
@@ -297,14 +296,14 @@ async fn handle_stream(
                                                 }
                                             }
                                         }
-                                        Err(_e) => { /* eprintln!("Stream JSON parse error: {}", e); eprintln!("Problematic JSON: {}", json_str); */
-                                        }
+                                    }
+                                    Err(_e) => { /* eprintln!("Stream JSON parse error: {}", e); eprintln!("Problematic JSON: {}", json_str); */
                                     }
                                 }
                             }
-                        } else {
-                            break;
                         }
+                    } else {
+                        break;
                     }
                 }
             }
