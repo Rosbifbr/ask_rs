@@ -44,7 +44,7 @@ pub fn get_settings() -> Settings {
         ProviderSettings {
             model: "gemini-1.5-flash-latest".to_string(),
             host: "generativelanguage.googleapis.com".to_string(),
-            endpoint: "/v1beta/models/gemini-1.5-flash-latest:streamGenerateContent".to_string(),
+            endpoint: "".to_string(),
             api_key_variable: "GEMINI_API_KEY".to_string(),
         },
     );
