@@ -82,6 +82,7 @@ pub async fn perform_request(
             "model": conversation_state.model,
             "stream": true
         });
+        // TODO: Move API exceptions elsewhere
         // o* mini want other settings
         let pat = Regex::new(r"o\d-mini").unwrap();
         if !provider_settings.host.contains("openai")
@@ -90,7 +91,10 @@ pub async fn perform_request(
             body["max_tokens"] = serde_json::json!(settings.max_tokens);
             body["temperature"] = serde_json::json!(settings.temperature);
         }
-        body["user"] = serde_json::json!(whoami::username());
+        if settings.provider != "mistral" {
+            body["user"] = serde_json::json!(whoami::username());
+        }
+
         request_body_json = body;
     }
 

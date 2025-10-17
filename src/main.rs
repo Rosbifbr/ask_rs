@@ -108,6 +108,7 @@ async fn main() {
         let data = fs::read_to_string(&transcript_path).expect("Unable to read transcript file");
         serde_json::from_str(&data).expect("Unable to parse transcript JSON")
     } else {
+        // TODO: Move API exceptions elsewhere
         let initial_message = if !matches.get_flag("plain") {
             let role = if provider_settings.model.contains("gemini-") {
                 "user".to_string()
