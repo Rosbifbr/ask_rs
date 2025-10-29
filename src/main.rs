@@ -21,6 +21,7 @@ use std::env;
 use std::fs;
 use std::io::{self, Read};
 use std::os::unix::process;
+use std::process::Command;
 
 #[tokio::main]
 async fn main() {
@@ -119,9 +120,23 @@ async fn main() {
             } else {
                 "system".to_string()
             };
+            let command_to_run =
+                format!("echo \"{}\"", &settings.startup_message.replace('"', "\\\""));
+            let output = Command::new("sh")
+                .arg("-c")
+                .arg(command_to_run)
+                .output();
+
+            let startup_message = match output {
+                Ok(out) if out.status.success() => {
+                    String::from_utf8_lossy(&out.stdout).trim_end().to_string()
+                }
+                _ => settings.startup_message.clone(),
+            };
+
             Some(Message {
                 role,
-                content: settings.startup_message.clone().into(),
+                content: startup_message.into(),
             })
         } else {
             None
