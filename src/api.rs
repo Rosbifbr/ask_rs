@@ -84,9 +84,8 @@ pub async fn perform_request(
         });
         // TODO: Move API exceptions elsewhere
         // o* mini want other settings
-        let pat = Regex::new(r"o\d-mini").unwrap();
-        if !provider_settings.host.contains("openai")
-            || !pat.is_match(provider_settings.model.as_str())
+        let pat = Regex::new(r"o\d-mini|gpt-5").unwrap();
+        if !pat.is_match(provider_settings.model.as_str()) || !provider_settings.host.contains("openai")
         {
             body["max_tokens"] = serde_json::json!(settings.max_tokens);
             body["temperature"] = serde_json::json!(settings.temperature);
