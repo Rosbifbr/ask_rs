@@ -14,12 +14,11 @@ use crate::image::{add_image_to_pipeline, detect_clipboard_command};
 use crate::recursive::handle_recursive_mode;
 use crate::settings::get_settings;
 
-use atty::Stream;
 use clap::{Arg, ArgAction, Command as ClapCommand};
 use serde_json::Value;
 use std::env;
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, IsTerminal, Read};
 use std::os::unix::process;
 use std::process::Command;
 
@@ -148,7 +147,7 @@ async fn main() {
     };
 
     let mut input_parts = Vec::new();
-    if !atty::is(Stream::Stdin) {
+    if !io::stdin().is_terminal() {
         let mut buffer = String::new();
         io::stdin()
             .read_to_string(&mut buffer)

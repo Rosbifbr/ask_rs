@@ -12,8 +12,7 @@ reqwest = { version = "0.11", features = ["blocking", "json", "stream"] } # Adde
 term_size = "0.3"
 whoami = "1.2" # Note: previous code used 1.4, this might be a slight downgrade if specific 1.4 features were relied on, but likely fine.
 base64 = "0.21"
-atty = "0.2"
 dialoguer = "0.10"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] } # Added tokio for async runtime
-bytes = "1" # Added bytes, as reqwest::Bytes (from stream) comes from this```
+bytes = "1" # Added bytes, as reqwest::Bytes (from stream) comes from this
 regex = "1.11.1"
