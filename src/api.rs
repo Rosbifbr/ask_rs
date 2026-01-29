@@ -1,17 +1,13 @@
 
-use crate::conversation::{ConversationState, Message};
+use crate::conversation::{ConversationState, Message, prompt_confirm};
 use crate::settings::{ProviderSettings, Settings};
-use futures_util::StreamExt;
-use regex::Regex;
 use serde_json::Value;
 use std::env;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::PathBuf;
-use std::time::Duration;
-use dialoguer::Confirm;
 
-pub async fn perform_request(
+pub fn perform_request(
     input: Value,
     conversation_state: &mut ConversationState,
     transcript_path: &PathBuf,
@@ -84,23 +80,20 @@ pub async fn perform_request(
         });
         // TODO: Move API exceptions elsewhere
         // o* mini want other settings
-        let pat = Regex::new(r"o\d-mini|gpt-5").unwrap();
-        if !pat.is_match(provider_settings.model.as_str()) || !provider_settings.host.contains("openai")
+        let is_reasoning_model = 
+            (provider_settings.model.contains("o") && provider_settings.model.contains("-mini") && provider_settings.host.contains("openai"))
+            || provider_settings.model.contains("gpt-5");
+        if !is_reasoning_model || !provider_settings.host.contains("openai")
         {
             body["max_tokens"] = serde_json::json!(settings.max_tokens);
             body["temperature"] = serde_json::json!(settings.temperature);
         }
         if settings.provider != "mistral" {
-            body["user"] = serde_json::json!(whoami::username());
+            body["user"] = serde_json::json!(env::var("USER").unwrap_or_else(|_| "user".to_string()));
         }
 
         request_body_json = body;
     }
-
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(300))
-        .build()
-        .unwrap();
 
     let api_key = env::var(&provider_settings.api_key_variable).unwrap();
 
@@ -113,86 +106,71 @@ pub async fn perform_request(
         provider_settings.endpoint.clone()
     };
 
-    let request_builder = client
-        .post(format!("https://{}{}", provider_settings.host, endpoint))
-        .header("Content-Type", "application/json")
-        .json(&request_body_json);
+    let url = format!("https://{}{}", provider_settings.host, endpoint);
+    
+    let mut request = ureq::post(&url)
+        .set("Content-Type", "application/json");
 
-    let res = if provider_settings.model.contains("gemini-") {
-        request_builder.query(&[("key", api_key)]).send().await
+    if provider_settings.model.contains("gemini-") {
+        request = request.query("key", &api_key);
     } else {
-        request_builder
-            .header("Authorization", format!("Bearer {}", api_key))
-            .send()
-            .await
-    };
+        request = request.set("Authorization", &format!("Bearer {}", api_key));
+    }
 
-    match res {
+    match request.send_json(request_body_json) {
         Ok(response) => {
-            if response.status().is_success() {
-                let (assistant_role, assistant_content_full) =
-                    handle_stream(response, provider_settings, suppress_stream_print).await;
+            let (assistant_role, assistant_content_full) =
+                handle_stream(response, provider_settings, suppress_stream_print);
 
-                if !suppress_stream_print && !assistant_content_full.is_empty() {
-                    println!();
-                }
+            if !suppress_stream_print && !assistant_content_full.is_empty() {
+                println!();
+            }
 
-                let assistant_message = Message {
-                    role: assistant_role,
-                    content: Value::String(assistant_content_full),
-                };
-                conversation_state.messages.push(assistant_message);
+            let assistant_message = Message {
+                role: assistant_role,
+                content: Value::String(assistant_content_full),
+            };
+            conversation_state.messages.push(assistant_message);
 
-                let mut truncated_state = conversation_state.clone();
-                if truncated_state.messages.len() >= 2 {
-                    let indices = [
-                        truncated_state.messages.len() - 2,
-                        truncated_state.messages.len() - 1,
-                    ];
-                    let mut should_truncate = false;
-                    for &i in &indices {
-                        if let Some(text) = truncated_state.messages[i].content.as_str() {
-                            if text.len() > 5000 {
-                                should_truncate = true;
-                                break;
-                            }
+            let mut truncated_state = conversation_state.clone();
+            if truncated_state.messages.len() >= 2 {
+                let indices = [
+                    truncated_state.messages.len() - 2,
+                    truncated_state.messages.len() - 1,
+                ];
+                let mut should_truncate = false;
+                for &i in &indices {
+                    if let Some(text) = truncated_state.messages[i].content.as_str() {
+                        if text.len() > 5000 {
+                            should_truncate = true;
+                            break;
                         }
                     }
-                    if should_truncate {
-                        if Confirm::new()
-                            .with_prompt(
-                                "Your last message or assistant response was too large, recommend truncating history for this session?",
-                            )
-                            .default(true)
-                            .interact()
-                            .unwrap_or(false)
-                        {
-                            for &i in &indices {
-                                if let Some(text) = truncated_state.messages[i].content.as_str() {
-                                    if text.len() > 5000 {
-                                        truncated_state.messages[i].content =
-                                            serde_json::json!(format!("{} [truncated]", &text[..5000]));
-                                    }
+                }
+                if should_truncate {
+                    if prompt_confirm(
+                            "Your last message or assistant response was too large, recommend truncating history for this session?",
+                            true
+                        )
+                    {
+                        for &i in &indices {
+                            if let Some(text) = truncated_state.messages[i].content.as_str() {
+                                if text.len() > 5000 {
+                                    truncated_state.messages[i].content =
+                                        serde_json::json!(format!("{} [truncated]", &text[..5000]));
                                 }
                             }
                         }
                     }
                 }
-                let conversation_json = serde_json::to_string_pretty(&truncated_state).unwrap();
-                fs::write(transcript_path, conversation_json)
-                    .expect("Unable to write transcript file");
-            } else {
-                let status = response.status();
-                let error_body = response
-                    .text()
-                    .await
-                    .unwrap_or_else(|_| "Failed to read error body".to_string());
-                eprintln!("API Error: {} - {}", status, error_body);
-                eprintln!(
-                    "Request body: {}",
-                    serde_json::to_string_pretty(&request_body_json).unwrap_or_default()
-                );
             }
+            let conversation_json = serde_json::to_string_pretty(&truncated_state).unwrap();
+            fs::write(transcript_path, conversation_json)
+                .expect("Unable to write transcript file");
+        },
+        Err(ureq::Error::Status(code, response)) => {
+            let error_body = response.into_string().unwrap_or_else(|_| "Failed to read error body".to_string());
+            eprintln!("API Error: {} - {}", code, error_body);
         }
         Err(e) => {
             eprintln!("HTTP request error: {}", e);
@@ -200,12 +178,12 @@ pub async fn perform_request(
     }
 }
 
-async fn handle_stream(
-    response: reqwest::Response,
+fn handle_stream(
+    response: ureq::Response,
     provider_settings: &ProviderSettings,
     suppress_print: bool,
 ) -> (String, String) {
-    let mut stream = response.bytes_stream(); // Requires "stream" feature for reqwest
+    let mut reader = response.into_reader();
     let mut full_content = String::new();
     let mut role = if provider_settings.model.contains("gemini-") {
         "model".to_string()
@@ -214,12 +192,13 @@ async fn handle_stream(
     };
 
     let mut buffer = String::new();
+    let mut chunk = [0; 1024];
 
-    while let Some(item) = stream.next().await {
-        match item {
-            Ok(chunk) => {
-                // chunk here is of type bytes::Bytes
-                buffer.push_str(&String::from_utf8_lossy(&chunk));
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) => break, // End of stream
+            Ok(n) => {
+                buffer.push_str(&String::from_utf8_lossy(&chunk[..n]));
 
                 loop {
                     if let Some(newline_idx) = buffer.find('\n') {

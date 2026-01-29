@@ -14,7 +14,6 @@ use crate::image::{add_image_to_pipeline, detect_clipboard_command};
 use crate::recursive::handle_recursive_mode;
 use crate::settings::get_settings;
 
-use clap::{Arg, ArgAction, Command as ClapCommand};
 use serde_json::Value;
 use std::env;
 use std::fs;
@@ -22,56 +21,59 @@ use std::io::{self, IsTerminal, Read};
 use std::os::unix::process;
 use std::process::Command;
 
-#[tokio::main]
-async fn main() {
-    let matches = ClapCommand::new("ask")
-        .version("1.4")
-        .author("Rodrigo Ourique")
-        .about("Rust terminal LLM caller with streaming")
-        .arg(Arg::new("input").help("Input values").num_args(0..))
-        .arg(
-            Arg::new("image")
-                .short('i')
-                .help("Push image from clipboard into pipeline")
-                .action(ArgAction::SetTrue),
-        )
-        .arg(
-            Arg::new("manage")
-                .short('o')
-                .help("Manage ongoing conversations")
-                .action(ArgAction::SetTrue),
-        )
-        .arg(
-            Arg::new("clear")
-                .short('c')
-                .help("Clear current conversation")
-                .action(ArgAction::SetTrue),
-        )
-        .arg(
-            Arg::new("last")
-                .short('l')
-                .help("Get last message")
-                .action(ArgAction::SetTrue),
-        )
-        .arg(
-            Arg::new("clear_all")
-                .short('C')
-                .help("Remove all chats")
-                .action(ArgAction::SetTrue),
-        )
-        .arg(
-            Arg::new("recursive")
-                .short('r')
-                .help("Interactive agent mode")
-                .action(ArgAction::SetTrue),
-        )
-        .arg(
-            Arg::new("plain")
-                .short('p')
-                .help("Start conversation without system prompt")
-                .action(ArgAction::SetTrue),
-        )
-        .get_matches();
+struct Args {
+    input: Vec<String>,
+    image: bool,
+    manage: bool,
+    clear: bool,
+    last: bool,
+    clear_all: bool,
+    recursive: bool,
+    plain: bool,
+}
+
+impl Args {
+    fn parse() -> Self {
+        let mut args = Args {
+            input: Vec::new(),
+            image: false,
+            manage: false,
+            clear: false,
+            last: false,
+            clear_all: false,
+            recursive: false,
+            plain: false,
+        };
+
+        let mut env_args = env::args().skip(1);
+        while let Some(arg) = env_args.next() {
+            match arg.as_str() {
+                "-i" | "--image" => args.image = true,
+                "-o" | "--manage" => args.manage = true,
+                "-c" | "--clear" => args.clear = true,
+                "-l" | "--last" => args.last = true,
+                "-C" | "--clear_all" => args.clear_all = true,
+                "-r" | "--recursive" => args.recursive = true,
+                "-p" | "--plain" => args.plain = true,
+                "-h" | "--help" => {
+                    println!("ask-rs 1.4\nRust terminal LLM caller with streaming\n\nUSAGE:\n    ask [FLAGS] [INPUT]...\n\nFLAGS:\n    -i, --image       Push image from clipboard into pipeline\n    -o, --manage      Manage ongoing conversations\n    -c, --clear       Clear current conversation\n    -l, --last        Get last message\n    -C, --clear_all   Remove all chats\n    -r, --recursive   Interactive agent mode\n    -p, --plain       Start conversation without system prompt\n    -h, --help        Prints help information");
+                    std::process::exit(0);
+                }
+                val => {
+                    if !val.starts_with('-') {
+                         args.input.push(val.to_string());
+                    } else {
+                        eprintln!("Unknown flag: {}", val);
+                    }
+                }
+            }
+        }
+        args
+    }
+}
+
+fn main() {
+    let args = Args::parse();
 
     let settings = get_settings();
     let provider_settings = settings
@@ -109,7 +111,7 @@ async fn main() {
         serde_json::from_str(&data).expect("Unable to parse transcript JSON")
     } else {
         // TODO: Move API exceptions elsewhere
-        let initial_message = if !matches.get_flag("plain") {
+        let initial_message = if !args.plain {
             let role = if provider_settings.model.contains("gemini-") {
                 "user".to_string()
             } else if provider_settings.model.contains("o1-")
@@ -157,8 +159,8 @@ async fn main() {
         }
     }
 
-    if let Some(values) = matches.get_many::<String>("input") {
-        let input_str = values.map(|s| s.as_str()).collect::<Vec<&str>>().join(" ");
+    if !args.input.is_empty() {
+        let input_str = args.input.join(" ");
         if !input_str.trim().is_empty() {
             input_parts.push(input_str);
         }
@@ -171,26 +173,25 @@ async fn main() {
     };
     let input_string_for_recursive = input_value.as_str().unwrap_or("").to_string();
 
-    if matches.get_flag("recursive") {
+    if args.recursive {
         handle_recursive_mode(
             &mut conversation_state,
             &transcript_path,
             input_string_for_recursive,
             &settings,
             &provider_settings,
-        )
-        .await;
+        );
         return;
-    } else if matches.get_flag("clear_all") {
+    } else if args.clear_all {
         delete_all_files_action(&settings);
         return;
-    } else if matches.get_flag("manage") && !matches.get_one::<String>("input").is_some() {
+    } else if args.manage && args.input.is_empty() {
         manage_ongoing_convos(&mut conversation_state, &transcript_path, &settings);
         return;
-    } else if matches.get_flag("clear") && !matches.get_one::<String>("input").is_some() {
+    } else if args.clear && args.input.is_empty() {
         clear_current_convo(&transcript_path);
         return;
-    } else if matches.get_flag("last") && !matches.get_one::<String>("input").is_some() {
+    } else if args.last && args.input.is_empty() {
         if let Some(last_message) = conversation_state.messages.last() {
             if let Ok(pretty_json) = serde_json::to_string_pretty(&last_message.content) {
                 println!("{}", pretty_json);
@@ -205,7 +206,7 @@ async fn main() {
     }
 
     let clipboard_command = detect_clipboard_command(&settings);
-    if matches.get_flag("image") {
+    if args.image {
         add_image_to_pipeline(&mut input_value, &clipboard_command, &settings);
     }
 
@@ -221,6 +222,5 @@ async fn main() {
         &settings,
         &provider_settings,
         false,
-    )
-    .await;
+    );
 }

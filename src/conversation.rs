@@ -1,13 +1,12 @@
 
-use crate::settings::{Settings, get_settings};
+use crate::settings::Settings;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
-use dialoguer::{theme::ColorfulTheme, Select};
-
+use std::io::{self, Write};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Message {
@@ -19,6 +18,47 @@ pub struct Message {
 pub struct ConversationState {
     pub model: String,
     pub messages: Vec<Message>,
+}
+
+pub fn prompt_input(prompt: &str) -> String {
+    print!("{} ", prompt);
+    io::stdout().flush().unwrap();
+    let mut buffer = String::new();
+    io::stdin().read_line(&mut buffer).unwrap();
+    buffer.trim().to_string()
+}
+
+pub fn prompt_confirm(prompt: &str, default: bool) -> bool {
+    let default_str = if default { "Y/n" } else { "y/N" };
+    print!("{} [{}] ", prompt, default_str);
+    io::stdout().flush().unwrap();
+    let mut buffer = String::new();
+    io::stdin().read_line(&mut buffer).unwrap();
+    let input = buffer.trim().to_lowercase();
+    if input.is_empty() {
+        default
+    } else {
+        input == "y" || input == "yes"
+    }
+}
+
+pub fn prompt_select(prompt: &str, items: &[String]) -> usize {
+    println!("{}", prompt);
+    for (i, item) in items.iter().enumerate() {
+        println!("{}. {}", i + 1, item);
+    }
+    loop {
+        print!("Select an option (1-{}): ", items.len());
+        io::stdout().flush().unwrap();
+        let mut buffer = String::new();
+        io::stdin().read_line(&mut buffer).unwrap();
+        if let Ok(n) = buffer.trim().parse::<usize>() {
+            if n > 0 && n <= items.len() {
+                return n - 1;
+            }
+        }
+        println!("Invalid selection. Please try again.");
+    }
 }
 
 pub fn clear_current_convo(transcript_path: &PathBuf) {
@@ -80,7 +120,14 @@ pub fn show_history(conversation_state: &ConversationState, editor_command: Stri
 }
 
 fn horizontal_line(ch: char) -> String {
-    let columns = term_size::dimensions_stdout().map(|(w, _)| w).unwrap_or(80);
+    let columns = if let Ok(output) = ProcessCommand::new("tput").arg("cols").output() {
+        String::from_utf8(output.stdout)
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .unwrap_or(80)
+    } else {
+        80
+    };
     ch.to_string().repeat(columns)
 }
 
@@ -186,14 +233,9 @@ pub fn manage_ongoing_convos(
 
     options.insert(0, ">>> Delete All Conversations".to_string());
 
-    let selection = Select::with_theme(&ColorfulTheme::default())
-        .with_prompt("Select an option to manage")
-        .default(0)
-        .items(&options)
-        .interact();
+    let index = prompt_select("Select an option to manage", &options);
 
-    if let Ok(index) = selection {
-        if index == 0 {
+    if index == 0 {
             delete_all_files_action(settings);
             if current_transcript_path.exists() {
                 let current_filename = current_transcript_path
@@ -207,89 +249,84 @@ pub fn manage_ongoing_convos(
                 }
             }
             return;
+    }
+
+    let selected_file_index = index - 1;
+    if selected_file_index >= files.len() {
+        println!("Invalid selection.");
+        return;
+    }
+    let selected_file = &files[selected_file_index];
+
+    let action_index = prompt_select(
+        &format!(
+            "Action for {}:",
+            selected_file.file_name().unwrap_or_default().to_string_lossy()
+        ),
+        &["Delete".to_string(), "Copy to Current Conversation".to_string(), "Cancel".to_string()]
+    );
+
+    match action_index {
+        0 => {
+            if let Err(e) = fs::remove_file(selected_file) {
+                println!("Failed to delete conversation: {}", e);
+            } else {
+                println!(
+                    "Conversation {} deleted successfully.",
+                    selected_file.display()
+                );
+            }
         }
+        1 => {
+            let data = fs::read_to_string(selected_file).unwrap_or_default();
+            match serde_json::from_str::<ConversationState>(&data) {
+                Ok(convo_to_copy) => {
+                    if convo_to_copy.model != current_convo.model {
+                        // Corrected: current_convo
+                        println!(
+                            "Cannot copy conversation: Model mismatch (current: {}, selected: {}).",
+                            current_convo.model, convo_to_copy.model // Corrected: current_convo
+                        );
+                        return;
+                    }
+                    let current_messages_is_empty = current_convo.messages.is_empty(); // Evaluate before closure
+                    let messages_to_add =
+                        convo_to_copy.messages.into_iter().skip_while(|msg| {
+                            !current_messages_is_empty
+                                && (msg.role == "system"
+                                    || (msg
+                                        .content
+                                        .as_str()
+                                        .map_or(false, |s| s == settings.startup_message)))
+                        });
+                    current_convo.messages.extend(messages_to_add);
 
-        let selected_file_index = index - 1;
-        if selected_file_index >= files.len() {
-            println!("Invalid selection.");
-            return;
-        }
-        let selected_file = &files[selected_file_index];
-
-        let action = Select::with_theme(&ColorfulTheme::default())
-            .with_prompt(format!(
-                "Action for {}:",
-                selected_file
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-            ))
-            .default(0)
-            .items(&["Delete", "Copy to Current Conversation", "Cancel"])
-            .interact();
-
-        match action {
-            Ok(0) => {
-                if let Err(e) = fs::remove_file(selected_file) {
-                    println!("Failed to delete conversation: {}", e);
-                } else {
-                    println!(
-                        "Conversation {} deleted successfully.",
-                        selected_file.display()
+                    match serde_json::to_string_pretty(current_convo) {
+                        Ok(conversation_json) => {
+                            if let Err(e) =
+                                fs::write(current_transcript_path, conversation_json)
+                            {
+                                eprintln!("Unable to write updated transcript file: {}", e);
+                            } else {
+                                println!(
+                                    "Conversation copied to current session successfully."
+                                );
+                            }
+                        }
+                        Err(e) => eprintln!("Could not serialize conversation to JSON: {}", e),
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "Could not parse selected conversation file {}: {}",
+                        selected_file.display(),
+                        e
                     );
                 }
             }
-            Ok(1) => {
-                let data = fs::read_to_string(selected_file).unwrap_or_default();
-                match serde_json::from_str::<ConversationState>(&data) {
-                    Ok(convo_to_copy) => {
-                        if convo_to_copy.model != current_convo.model {
-                            // Corrected: current_convo
-                            println!(
-                                "Cannot copy conversation: Model mismatch (current: {}, selected: {}).",
-                                current_convo.model, convo_to_copy.model // Corrected: current_convo
-                            );
-                            return;
-                        }
-                        let current_messages_is_empty = current_convo.messages.is_empty(); // Evaluate before closure
-                        let messages_to_add =
-                            convo_to_copy.messages.into_iter().skip_while(|msg| {
-                                !current_messages_is_empty
-                                    && (msg.role == "system"
-                                        || (msg
-                                            .content
-                                            .as_str()
-                                            .map_or(false, |s| s == settings.startup_message)))
-                            });
-                        current_convo.messages.extend(messages_to_add);
-
-                        match serde_json::to_string_pretty(current_convo) {
-                            Ok(conversation_json) => {
-                                if let Err(e) =
-                                    fs::write(current_transcript_path, conversation_json)
-                                {
-                                    eprintln!("Unable to write updated transcript file: {}", e);
-                                } else {
-                                    println!(
-                                        "Conversation copied to current session successfully."
-                                    );
-                                }
-                            }
-                            Err(e) => eprintln!("Could not serialize conversation to JSON: {}", e),
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "Could not parse selected conversation file {}: {}",
-                            selected_file.display(),
-                            e
-                        );
-                    }
-                }
-            }
-            _ => {
-                println!("Action cancelled.");
-            }
+        }
+        _ => {
+            println!("Action cancelled.");
         }
     }
 }
