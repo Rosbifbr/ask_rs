@@ -1,62 +1,66 @@
 ## ask
 
-ask is a very lightweight program that allows you to chat with OpenAI chatbots in a terminal without wasting the time to open a heavy browser or to switch screens. The application is lightweight and keeps one separate, manageable conversation history per process.
+ask is a lightweight terminal program for chatting with OpenAI-spec and Gemini chatbots, featuring:
 
-The script uses the newer chat API from OpenAI and is preconfigured to use the GPT-4 model (gpt-4). You can switch to "gpt-3" for cheaper tokens and better response time in the script settings.
+- **Multi-provider support:** Switch between OpenAI (GPT-4, GPT-3, GPT-4o, etc.) and Gemini models via config.
+- **Tool calling:** LLMs can invoke local tools/functions for advanced tasks (file, shell, web, etc.).
+- **Recursive/agent mode:** LLM can autonomously execute shell actions in a loop until tasks are complete.
+- **Image input:** Send clipboard images (auto-detects Xorg/Wayland).
+- **Session management:** Manage, clear, and list conversations easily.
+- **Configurable:** All behavior (models, endpoints, commands) is set in a JSON config.
+- **POSIX functionality:** All of the POSIX shell wonders, like piping, redirection, etc are supported.
 
-## Installation
-
-To use it on UNIX-based systems, all you need to do is to compile/download the binary and run
+### Installation
 
 ```bash
-cargo build -r 
+cargo build -r
 sudo cp target/release/ask /bin/ask
 ```
 
-## Usage and Examples
+### Usage
 
-First off, be sure to configure your API key in an environment variable, like you do for scripts such as avante.nvim.
+- Set your API key(s) as environment variables (e.g., `OPENAI_API_KEY`, `GEMINI_API_KEY`).
+- Run `ask` with your prompt or pipe input:
+  - `ask "Hi there"`
+  - `cat file.rs | ask "Explain this code"`
+  - `ask -i "Describe this image"` (clipboard image)
+  - `ask -r "Automate a task"` (agent mode)
+  - `ask -o` (manage sessions)
+  - `ask -c` (clear current session)
+  - `ask -C` (clear all sessions)
 
-The operating principle is very simple. Call the program, wait for a response and answer at will. Customize the program's behaviour in ask.json, in your .config dir.
+### Configuration
 
-![image](https://github.com/user-attachments/assets/8ef71d4a-090b-41af-bc70-cf3e32c83ddc)
+Edit `ask.json` in your config directory to set providers, models, and commands.
 
-`ask "Hi there"` - Prompts the model.
+### Example `ask.json`
 
-`ask Unqouted strings work too!` - Prompts the model.
-
-`ask Hey there. Can you help me interpret the contents of this directory? $(ls -la)` - Prompts the model with interpolated shell output (Syntax may vary. Example is in bash).
-
-`ask` - Displays the current conversation state.
-
-`ask -c` - Clears current conversation
-
-`ask -C` - Clears all conversations
-
-`ask -o` - Manages ongoing session.
-
-`ask -i - Passes image on the clipboard to the model (Configure clipboard extraction command. Ask is configured to use xclip by default)`
-
-`cat some_file.c | ask "What does this code do?"` - Parses file then question passed as argument.
-
-`ask -r` - Enters interactive agent mode. The model will keep trying to follow your instructions in the shell until it deems its task isfinished.
-
-## Sample ask.json schema
-
-```JSON
+```json
 {
-  "model": "o1",
-  "host": "api.openai.com",
-  "api_key_variable": "OPENAI_API_KEY",
-  "endpoint": "/v1/chat/completions",
+  "providers": {
+    "oai": {
+      "model": "gpt-4o-mini",
+      "host": "api.openai.com",
+      "endpoint": "/v1/chat/completions",
+      "api_key_variable": "OPENAI_API_KEY"
+    },
+    "gemini": {
+      "model": "gemini-1.5-flash-latest",
+      "host": "generativelanguage.googleapis.com",
+      "endpoint": "",
+      "api_key_variable": "GEMINI_API_KEY"
+    }
+  },
+  "provider": "oai",
   "max_tokens": 2048,
   "temperature": 0.6,
   "vision_detail": "high",
-  "editor": "more",
   "transcript_name": "gpt_transcript-",
+  "editor": "more",
   "clipboard_command_xorg": "xclip -selection clipboard -t image/png -o",
   "clipboard_command_wayland": "wl-paste",
   "clipboard_command_unsupported": "UNSUPPORTED",
-  "startup_message": "You are ChatConcise, a very advanced LLM designed for experienced users. As ChatConcise you oblige to adhere to the following directives UNLESS overridden by the user:\nBe concise, proactive, helpful and efficient. Do not say anything more than what needed, but also, DON'T BE LAZY. If the user is asking for software, provide ONLY the code."
+  "startup_message": "You are ChatConcise...",
+  "recursive_mode_startup_prompt_template": "You are an agent. {user_input}"
 }
 ```
