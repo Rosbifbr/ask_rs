@@ -4,6 +4,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
 use std::process::Command;
+use scraper::{Html, Selector};
 
 /// A tool that can be called by the LLM
 pub trait Tool: Send + Sync {
@@ -80,6 +81,7 @@ pub fn create_default_registry() -> ToolRegistry {
     registry.register(Box::new(ReadFileTool));
     registry.register(Box::new(WriteFileTool));
     registry.register(Box::new(WebSearchTool));
+    registry.register(Box::new(WebPageReaderTool));
     registry.register(Box::new(SearchFilesTool));
     registry.register(Box::new(ExecuteCommandTool));
     registry
@@ -97,7 +99,7 @@ impl Tool for ReadFileTool {
     }
 
     fn description(&self) -> &'static str {
-        "Read the contents of a file at the given path. Returns the file content as text."
+        "Read the contents of a file at the given path. Supports chunked reading with offset/limit, and case-insensitive string search with context."
     }
 
     fn parameters(&self) -> Value {
@@ -107,6 +109,22 @@ impl Tool for ReadFileTool {
                 "path": {
                     "type": "string",
                     "description": "The path to the file to read"
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "Starting line number (1-indexed). If not specified, starts from line 1."
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of lines to read. If not specified, reads all remaining lines."
+                },
+                "search": {
+                    "type": "string",
+                    "description": "Case-insensitive string to search for. Returns only matching lines with surrounding context."
+                },
+                "context_lines": {
+                    "type": "integer",
+                    "description": "Number of lines to show before and after each search match (default: 3). Only used with 'search'."
                 }
             },
             "required": ["path"]
@@ -126,8 +144,98 @@ impl Tool for ReadFileTool {
             return Err(format!("File not found: {}", path));
         }
 
-        fs::read_to_string(file_path)
-            .map_err(|e| format!("Failed to read file '{}': {}", path, e))
+        let content = fs::read_to_string(file_path)
+            .map_err(|e| format!("Failed to read file '{}': {}", path, e))?;
+
+        let lines: Vec<&str> = content.lines().collect();
+        let total_lines = lines.len();
+
+        // Handle search mode
+        if let Some(search_term) = args.get("search").and_then(|s| s.as_str()) {
+            let context = args
+                .get("context_lines")
+                .and_then(|c| c.as_u64())
+                .unwrap_or(3) as usize;
+
+            let search_lower = search_term.to_lowercase();
+            let mut matches: Vec<(usize, &str)> = Vec::new();
+
+            // Find all matching lines
+            for (idx, line) in lines.iter().enumerate() {
+                if line.to_lowercase().contains(&search_lower) {
+                    matches.push((idx, line));
+                }
+            }
+
+            if matches.is_empty() {
+                return Ok(format!("No matches found for '{}' in {}", search_term, path));
+            }
+
+            // Build output with context
+            let mut result = format!("Found {} match(es) for '{}' in {}:\n\n", matches.len(), search_term, path);
+            let mut shown_lines: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
+            for (match_idx, _) in &matches {
+                let start = match_idx.saturating_sub(context);
+                let end = (match_idx + context + 1).min(total_lines);
+
+                // Add separator if there's a gap from previous context
+                if !shown_lines.is_empty() {
+                    let last_shown = *shown_lines.iter().max().unwrap();
+                    if start > last_shown + 1 {
+                        result.push_str("  ...\n");
+                    }
+                }
+
+                for i in start..end {
+                    if shown_lines.contains(&i) {
+                        continue;
+                    }
+                    shown_lines.insert(i);
+
+                    let line_num = i + 1; // 1-indexed
+                    let marker = if i == *match_idx { ">" } else { " " };
+                    result.push_str(&format!("{} {:>4}: {}\n", marker, line_num, lines[i]));
+                }
+            }
+
+            return Ok(result);
+        }
+
+        // Handle chunked reading mode
+        let offset = args
+            .get("offset")
+            .and_then(|o| o.as_u64())
+            .map(|o| (o.saturating_sub(1)) as usize) // Convert to 0-indexed
+            .unwrap_or(0);
+
+        let limit = args
+            .get("limit")
+            .and_then(|l| l.as_u64())
+            .map(|l| l as usize);
+
+        if offset >= total_lines {
+            return Ok(format!("Offset {} exceeds file length ({} lines)", offset + 1, total_lines));
+        }
+
+        let end = match limit {
+            Some(l) => (offset + l).min(total_lines),
+            None => total_lines,
+        };
+
+        let mut result = String::new();
+
+        // Add header with line range info if using chunked reading
+        if offset > 0 || limit.is_some() {
+            result.push_str(&format!("Lines {}-{} of {} total:\n\n", offset + 1, end, total_lines));
+        }
+
+        for (idx, line) in lines[offset..end].iter().enumerate() {
+            let line_num = offset + idx + 1; // 1-indexed
+            result.push_str(&format!("{:>4}: {}\n", line_num, line));
+        }
+
+        Ok(result)
     }
 }
 
@@ -196,7 +304,7 @@ impl Tool for WebSearchTool {
     }
 
     fn description(&self) -> &'static str {
-        "Search the web for information using DuckDuckGo. Returns search results as text."
+        "Search the web using DuckDuckGo. Returns a list of relevant URLs with titles and snippets. Use this to find sources, then use web_read_page to read the content."
     }
 
     fn parameters(&self) -> Value {
@@ -205,7 +313,7 @@ impl Tool for WebSearchTool {
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "The search query"
+                    "description": "The search keywords"
                 }
             },
             "required": ["query"]
@@ -213,12 +321,11 @@ impl Tool for WebSearchTool {
     }
 
     fn execute(&self, args: &Value) -> Result<String, String> {
-        let query = args
-            .get("query")
+        let query = args.get("query")
             .and_then(|q| q.as_str())
             .ok_or("Missing 'query' argument")?;
 
-        // Use DuckDuckGo's lite HTML version for simple scraping
+        // 1. Fetch the Search Results
         let encoded_query = urlencoding::encode(query);
         let url = format!("https://lite.duckduckgo.com/lite/?q={}", encoded_query);
 
@@ -227,103 +334,102 @@ impl Tool for WebSearchTool {
             .call()
             .map_err(|e| format!("Search request failed: {}", e))?;
 
-        let body = response
-            .into_string()
+        let body = response.into_string()
             .map_err(|e| format!("Failed to read response: {}", e))?;
 
-        // Parse the HTML to extract search results
-        let results = parse_ddg_lite_results(&body);
+        // 2. Robust Parsing with 'scraper'
+        let document = Html::parse_document(&body);
+        
+        // DuckDuckGo Lite structure:
+        // Results are in a table. Links have class 'result-link'.
+        // Snippets are in the row immediately following the link.
+        let result_link_selector = Selector::parse(".result-link").unwrap();
+        let snippet_selector = Selector::parse(".result-snippet").unwrap();
 
-        if results.is_empty() {
-            Ok(format!("No results found for: {}", query))
+        let mut formatted_results = Vec::new();
+
+        // We zip the iterators because DDG Lite usually alternates Link Row -> Snippet Row
+        let links = document.select(&result_link_selector);
+        let snippets = document.select(&snippet_selector);
+
+        for (link_element, snippet_element) in links.zip(snippets).take(5) {
+            let title = link_element.text().collect::<Vec<_>>().join(" ");
+            let href = link_element.value().attr("href").unwrap_or_default();
+            let snippet = snippet_element.text().collect::<Vec<_>>().join(" ");
+
+            // Skip internal DDG links or empty results
+            if href.is_empty() || title.is_empty() {
+                continue;
+            }
+
+            formatted_results.push(json!({
+                "title": title.trim(),
+                "url": href,
+                "snippet": snippet.trim()
+            }));
+        }
+
+        if formatted_results.is_empty() {
+            return Ok("No results found.".to_string());
+        }
+
+        // Return JSON string so the AI can parse the URLs programmatically
+        Ok(serde_json::to_string_pretty(&formatted_results)
+           .map_err(|e| e.to_string())?)
+    }
+}
+
+pub struct WebPageReaderTool;
+
+impl Tool for WebPageReaderTool {
+    fn name(&self) -> &'static str {
+        "web_read_page"
+    }
+
+    fn description(&self) -> &'static str {
+        "Reads the full content of a specific webpage URL. Use this after web_search to get the details of a chosen result."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "The URL of the page to read (obtained from web_search)"
+                }
+            },
+            "required": ["url"]
+        })
+    }
+
+    fn execute(&self, args: &Value) -> Result<String, String> {
+        let url = args.get("url")
+            .and_then(|u| u.as_str())
+            .ok_or("Missing 'url' argument")?;
+
+        // 1. Fetch the Page
+        let response = ureq::get(url)
+            .set("User-Agent", "Mozilla/5.0 (compatible; ask-rs/1.0)")
+            .call()
+            .map_err(|e| format!("Failed to fetch page: {}", e))?;
+
+        let body = response.into_string()
+            .map_err(|e| format!("Failed to read page body: {}", e))?;
+
+        // 2. Convert HTML to Readable Text
+        // width: 80 is standard for readability, usually fits nicely in context windows
+        let clean_text = html2text::from_read(body.as_bytes(), 80);
+
+        // Optional: Truncate if the page is massive to prevent context overflow
+        // e.g., take the first 10,000 characters
+        let max_len = 10_000;
+        if clean_text.len() > max_len {
+            Ok(format!("{}...\n\n(Content truncated)", &clean_text[..max_len]))
         } else {
-            Ok(results.join("\n\n"))
+            Ok(clean_text)
         }
     }
-}
-
-/// Parse DuckDuckGo lite HTML to extract search results
-fn parse_ddg_lite_results(html: &str) -> Vec<String> {
-    let mut results = Vec::new();
-
-    // DDG lite uses simple HTML tables. We look for links and their descriptions.
-    // This is a simple parser - for production you'd want a proper HTML parser.
-
-    // Find result links (they're in <a> tags with class="result-link")
-    // DDG lite format: links are followed by snippets in the next table row
-
-    let mut current_title = String::new();
-    let mut current_url = String::new();
-
-    for line in html.lines() {
-        let line = line.trim();
-
-        // Look for result links
-        if line.contains("class=\"result-link\"") || line.contains("class='result-link'") {
-            // Extract href and text
-            if let Some(href_start) = line.find("href=\"").or_else(|| line.find("href='")) {
-                let quote_char = if line.contains("href=\"") { '"' } else { '\'' };
-                let href_content = &line[href_start + 6..];
-                if let Some(href_end) = href_content.find(quote_char) {
-                    current_url = href_content[..href_end].to_string();
-                }
-            }
-            // Extract link text
-            if let Some(gt_pos) = line.rfind('>') {
-                let text_part = &line[gt_pos + 1..];
-                if let Some(lt_pos) = text_part.find('<') {
-                    current_title = text_part[..lt_pos].to_string();
-                }
-            }
-        }
-
-        // Look for result snippets (class="result-snippet")
-        if (line.contains("class=\"result-snippet\"") || line.contains("class='result-snippet'"))
-            && !current_title.is_empty()
-        {
-            // Extract snippet text
-            let snippet = extract_text_from_html_line(line);
-            if !snippet.is_empty() {
-                results.push(format!(
-                    "**{}**\n{}\n{}",
-                    html_decode(&current_title),
-                    html_decode(&snippet),
-                    current_url
-                ));
-                current_title.clear();
-                current_url.clear();
-            }
-        }
-    }
-
-    // Limit results
-    results.truncate(5);
-    results
-}
-
-fn extract_text_from_html_line(line: &str) -> String {
-    let mut result = String::new();
-    let mut in_tag = false;
-
-    for ch in line.chars() {
-        match ch {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
-            _ if !in_tag => result.push(ch),
-            _ => {} // Ignore other characters when inside a tag
-        }
-    }
-
-    result.trim().to_string()
-}
-
-fn html_decode(s: &str) -> String {
-    s.replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&nbsp;", " ")
 }
 
 pub struct SearchFilesTool;

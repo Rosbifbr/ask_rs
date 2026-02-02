@@ -7,6 +7,12 @@ use std::env;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Threshold in bytes for tool output before writing to temp file
+/// Outputs larger than this will be written to a file and the AI
+/// will be instructed to read it in chunks using the read_file tool
+const LARGE_OUTPUT_THRESHOLD: usize = 8192; // 8KB
 
 pub fn perform_request(
     input: Value,
@@ -167,7 +173,7 @@ fn perform_request_loop(
 
                         let result = tool_registry.execute(tool_name, &args);
                         let result_content = match result {
-                            Ok(output) => output,
+                            Ok(output) => handle_large_tool_output(tool_name, output),
                             Err(err) => format!("Error: {}", err),
                         };
 
@@ -554,6 +560,51 @@ fn convert_message_to_gemini(msg: &Message) -> Value {
         "role": role,
         "parts": [{"text": msg.content.as_str().unwrap_or("")}]
     })
+}
+
+/// Handle potentially large tool output by writing to temp file if needed
+/// Returns the content to use in the tool result message
+fn handle_large_tool_output(tool_name: &str, output: String) -> String {
+    if output.len() <= LARGE_OUTPUT_THRESHOLD {
+        return output;
+    }
+
+    // Generate a unique temp file path
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let temp_dir = env::temp_dir();
+    let temp_file = temp_dir.join(format!("tool_output_{}_{}.txt", tool_name, timestamp));
+
+    // Write the full output to the temp file
+    match fs::write(&temp_file, &output) {
+        Ok(_) => {
+            let line_count = output.lines().count();
+            let byte_count = output.len();
+
+            // Return a message instructing the AI to read the file
+            format!(
+                "Output too large ({} bytes, {} lines). Written to temp file: {}\n\n\
+                To read the contents, use the read_file tool with this path.\n\
+                Preview (first 500 chars):\n{}\n[...]",
+                byte_count,
+                line_count,
+                temp_file.display(),
+                &output[..output.len().min(500)]
+            )
+        }
+        Err(e) => {
+            // If we can't write to temp file, truncate and return with warning
+            eprintln!("Warning: Could not write large output to temp file: {}", e);
+            format!(
+                "[Output truncated due to size ({} bytes). Error writing temp file: {}]\n\n{}",
+                output.len(),
+                e,
+                &output[..output.len().min(LARGE_OUTPUT_THRESHOLD)]
+            )
+        }
+    }
 }
 
 /// Save conversation state to transcript file with truncation handling

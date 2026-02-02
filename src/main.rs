@@ -61,7 +61,7 @@ impl Args {
                 "-p" | "--plain" => args.plain = true,
                 "-t" | "--tools" => args.tools = false,
                 "-h" | "--help" => {
-                    println!("ask-rs 1.5\nRust terminal LLM caller with streaming\n\nUSAGE:\n    ask [FLAGS] [INPUT]...\n\nFLAGS:\n    -i, --image       Push image from clipboard into pipeline\n    -o, --manage      Manage ongoing conversations\n    -c, --clear       Clear current conversation\n    -l, --last        Get last message\n    -C, --clear_all   Remove all chats\n    -r, --recursive   Interactive agent mode\n    -t, --tools       Enable tool use (read_file, write_file, web_search)\n    -p, --plain       Start conversation without system prompt\n    -h, --help        Prints help information");
+                    println!("ask-rs 1.5\nRust terminal LLM caller with streaming\n\nUSAGE:\n    ask [FLAGS] [INPUT]...\n\nFLAGS:\n    -i, --image       Push image from clipboard into pipeline\n    -o, --manage      Manage ongoing conversations\n    -c, --clear       Clear current conversation\n    -l, --last        Get last message\n    -C, --clear_all   Remove all chats\n    -r, --recursive   Interactive agent mode\n    -t, --tools       Disable tool use (read_file, write_file, web_search)\n    -p, --plain       Start conversation without system prompt\n    -h, --help        Prints help information");
                     std::process::exit(0);
                 }
                 val => {
