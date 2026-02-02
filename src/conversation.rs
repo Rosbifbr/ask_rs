@@ -150,11 +150,16 @@ pub fn delete_all_files_action(settings: &Settings) {
             .filter_map(|e| e.ok())
             .map(|e| e.path())
             .filter(|p| {
-                p.is_file()
-                    && p.file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .starts_with(&settings.transcript_name)
+                 p.is_file()
+                    && (
+                        p.file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .starts_with(&settings.transcript_name) ||
+                        p.file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .starts_with("tool_output_"))
             })
             .collect();
 
