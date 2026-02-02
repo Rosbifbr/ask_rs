@@ -4,6 +4,7 @@ mod conversation;
 mod image;
 mod recursive;
 mod settings;
+mod tools;
 
 use crate::api::perform_request;
 use crate::conversation::{
@@ -13,6 +14,7 @@ use crate::conversation::{
 use crate::image::{add_image_to_pipeline, detect_clipboard_command};
 use crate::recursive::handle_recursive_mode;
 use crate::settings::get_settings;
+use crate::tools::create_default_registry;
 
 use serde_json::Value;
 use std::env;
@@ -30,6 +32,7 @@ struct Args {
     clear_all: bool,
     recursive: bool,
     plain: bool,
+    tools: bool,
 }
 
 impl Args {
@@ -43,6 +46,7 @@ impl Args {
             clear_all: false,
             recursive: false,
             plain: false,
+            tools: true, // Tools are enabled by default
         };
 
         let mut env_args = env::args().skip(1);
@@ -55,8 +59,9 @@ impl Args {
                 "-C" | "--clear_all" => args.clear_all = true,
                 "-r" | "--recursive" => args.recursive = true,
                 "-p" | "--plain" => args.plain = true,
+                "-t" | "--tools" => args.tools = false,
                 "-h" | "--help" => {
-                    println!("ask-rs 1.4\nRust terminal LLM caller with streaming\n\nUSAGE:\n    ask [FLAGS] [INPUT]...\n\nFLAGS:\n    -i, --image       Push image from clipboard into pipeline\n    -o, --manage      Manage ongoing conversations\n    -c, --clear       Clear current conversation\n    -l, --last        Get last message\n    -C, --clear_all   Remove all chats\n    -r, --recursive   Interactive agent mode\n    -p, --plain       Start conversation without system prompt\n    -h, --help        Prints help information");
+                    println!("ask-rs 1.5\nRust terminal LLM caller with streaming\n\nUSAGE:\n    ask [FLAGS] [INPUT]...\n\nFLAGS:\n    -i, --image       Push image from clipboard into pipeline\n    -o, --manage      Manage ongoing conversations\n    -c, --clear       Clear current conversation\n    -l, --last        Get last message\n    -C, --clear_all   Remove all chats\n    -r, --recursive   Interactive agent mode\n    -t, --tools       Enable tool use (read_file, write_file, web_search)\n    -p, --plain       Start conversation without system prompt\n    -h, --help        Prints help information");
                     std::process::exit(0);
                 }
                 val => {
@@ -173,6 +178,13 @@ fn main() {
     };
     let input_string_for_recursive = input_value.as_str().unwrap_or("").to_string();
 
+    // Create tool registry if tools are enabled
+    let tool_registry = if args.tools || args.recursive {
+        Some(create_default_registry())
+    } else {
+        None
+    };
+
     if args.recursive {
         handle_recursive_mode(
             &mut conversation_state,
@@ -180,6 +192,7 @@ fn main() {
             input_string_for_recursive,
             &settings,
             &provider_settings,
+            tool_registry.as_ref(),
         );
         return;
     } else if args.clear_all {
@@ -222,5 +235,6 @@ fn main() {
         &settings,
         &provider_settings,
         false,
+        tool_registry.as_ref(),
     );
 }
