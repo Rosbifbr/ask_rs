@@ -6,6 +6,8 @@ on:
 jobs:
   release:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
@@ -13,7 +15,7 @@ jobs:
         uses: ncipollo/release-action@v1
         with:
           tag: v${{ github.run_number }}
-          release_name: Release ${{ github.run_number }}
+          name: Release ${{ github.run_number }}
           body: |
             Automated release from master on run ${{ github.run_number }}
           draft: false
