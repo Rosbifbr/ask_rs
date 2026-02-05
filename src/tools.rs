@@ -4,7 +4,10 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use scraper::{Html, Selector};
+
+static AUTO_APPROVE_COMMANDS: AtomicBool = AtomicBool::new(false);
 
 /// A tool that can be called by the LLM
 pub trait Tool: Send + Sync {
@@ -155,7 +158,7 @@ impl Tool for ReadFileTool {
             let context = args
                 .get("context_lines")
                 .and_then(|c| c.as_u64())
-                .unwrap_or(3) as usize;
+                .unwrap_or(6) as usize;
 
             let search_lower = search_term.to_lowercase();
             let mut matches: Vec<(usize, &str)> = Vec::new();
@@ -530,17 +533,22 @@ impl Tool for ExecuteCommandTool {
             .and_then(|c| c.as_str())
             .ok_or("Missing 'command' argument")?;
 
-        // Request user approval
-        println!("\n\x1b[33m> The agent wants to execute the following command:\x1b[0m");
-        println!("\x1b[36m{}\x1b[0m", command_str);
-        print!("\x1b[33m> Do you approve this execution? [y/N]: \x1b[0m");
-        io::stdout().flush().map_err(|e| format!("Failed to flush stdout: {}", e))?;
+        // Skip prompt if user previously chose "always allow"
+        if !AUTO_APPROVE_COMMANDS.load(Ordering::Relaxed) {
+            // Request user approval
+            println!("\n\x1b[33m> The agent wants to execute the following command:\x1b[0m");
+            println!("\x1b[36m{}\x1b[0m", command_str);
+            print!("\x1b[33m> Do you approve this execution? [y/N/a]: \x1b[0m");
+            io::stdout().flush().map_err(|e| format!("Failed to flush stdout: {}", e))?;
 
-        let mut input = String::new();
-        io::stdin().read_line(&mut input).map_err(|e| format!("Failed to read input: {}", e))?;
+            let mut input = String::new();
+            io::stdin().read_line(&mut input).map_err(|e| format!("Failed to read input: {}", e))?;
 
-        if input.trim().to_lowercase() != "y" {
-            return Err("User denied command execution.".to_string());
+            match input.trim().to_lowercase().as_str() {
+                "a" => AUTO_APPROVE_COMMANDS.store(true, Ordering::Relaxed),
+                "y" => {}
+                _ => return Err("User denied command execution.".to_string()),
+            }
         }
 
         let output = Command::new("sh")

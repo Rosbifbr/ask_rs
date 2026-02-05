@@ -12,7 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Threshold in bytes for tool output before writing to temp file
 /// Outputs larger than this will be written to a file and the AI
 /// will be instructed to read it in chunks using the read_file tool
-const LARGE_OUTPUT_THRESHOLD: usize = 8192; // 8KB
+const LARGE_OUTPUT_THRESHOLD: usize = 32768; // 8KB
 
 pub fn perform_request(
     input: Value,
@@ -587,11 +587,11 @@ fn handle_large_tool_output(tool_name: &str, output: String) -> String {
             format!(
                 "Output too large ({} bytes, {} lines). Written to temp file: {}\n\n\
                 To read the contents, use the read_file tool with this path.\n\
-                Preview (first 500 chars):\n{}\n[...]",
+                Preview (first 2k chars):\n{}\n[...]",
                 byte_count,
                 line_count,
                 temp_file.display(),
-                &output[..output.len().min(500)]
+                &output[..output.len().min(2000)]
             )
         }
         Err(e) => {
@@ -618,7 +618,7 @@ fn save_conversation(conversation_state: &mut ConversationState, transcript_path
         let mut should_truncate = false;
         for &i in &indices {
             if let Some(text) = truncated_state.messages[i].content.as_str() {
-                if text.len() > 5000 {
+                if text.len() > LARGE_OUTPUT_THRESHOLD {
                     should_truncate = true;
                     break;
                 }
@@ -631,9 +631,9 @@ fn save_conversation(conversation_state: &mut ConversationState, transcript_path
             ) {
                 for &i in &indices {
                     if let Some(text) = truncated_state.messages[i].content.as_str() {
-                        if text.len() > 5000 {
+                        if text.len() > LARGE_OUTPUT_THRESHOLD {
                             truncated_state.messages[i].content =
-                                json!(format!("{} [truncated]", &text[..5000]));
+                                json!(format!("{} [truncated]", &text[..LARGE_OUTPUT_THRESHOLD]));
                         }
                     }
                 }
