@@ -6,15 +6,24 @@ on:
 jobs:
   release:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
+      - name: Build release binary
+        run: cargo build --release
+      - name: Strip binary
+        run: strip target/release/ask_rs
       - name: Create GitHub Release
+        id: create_release
         uses: ncipollo/release-action@v1
         with:
           tag: v${{ github.run_number }}
-          release_name: Release ${{ github.run_number }}
+          name: Release ${{ github.run_number }}
+          artifacts: "target/release/ask_rs"
           body: |
             Automated release from master on run ${{ github.run_number }}
           draft: false
           prerelease: false
+          token: ${{ secrets.GITHUB_TOKEN }}
