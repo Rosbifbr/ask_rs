@@ -83,6 +83,7 @@ pub fn create_default_registry() -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     registry.register(Box::new(ReadFileTool));
     registry.register(Box::new(WriteFileTool));
+    registry.register(Box::new(EditFileTool));
     registry.register(Box::new(WebSearchTool));
     registry.register(Box::new(WebPageReaderTool));
     registry.register(Box::new(SearchFilesTool));
@@ -102,7 +103,7 @@ impl Tool for ReadFileTool {
     }
 
     fn description(&self) -> &'static str {
-        "Read the contents of a file at the given path. Supports chunked reading with offset/limit, and case-insensitive string search with context."
+        "Read the contents of a file at the given path. Output includes line numbers (e.g. '  42: code here') which can be used with edit_file's line-range mode. Supports chunked reading with offset/limit, and case-insensitive string search with context."
     }
 
     fn parameters(&self) -> Value {
@@ -500,6 +501,211 @@ impl Tool for SearchFilesTool {
         } else {
             Ok(result)
         }
+    }
+}
+
+pub struct EditFileTool;
+
+impl Tool for EditFileTool {
+    fn name(&self) -> &'static str {
+        "edit_file"
+    }
+
+    fn description(&self) -> &'static str {
+        "Edit a file by replacing specific text or a line range. Use read_file first to see the file with line numbers, then apply targeted edits. Two modes:\n\
+         1) Search-and-replace: provide 'old_string' and 'new_string' to find and replace exact text.\n\
+         2) Line-range: provide 'start_line', 'end_line', and 'new_string' to replace a range of lines.\n\
+         For inserting new content without removing lines, set start_line and end_line to the same line and include the original line in new_string.\n\
+         Always prefer this over write_file for modifying existing files."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "The path to the file to edit"
+                },
+                "old_string": {
+                    "type": "string",
+                    "description": "The exact text to find and replace (for search-and-replace mode). Must match the file content exactly, including whitespace and indentation."
+                },
+                "new_string": {
+                    "type": "string",
+                    "description": "The replacement text. Used in both modes. Use empty string to delete text/lines."
+                },
+                "start_line": {
+                    "type": "integer",
+                    "description": "Starting line number (1-indexed, inclusive) for line-range mode. Use with end_line."
+                },
+                "end_line": {
+                    "type": "integer",
+                    "description": "Ending line number (1-indexed, inclusive) for line-range mode. Use with start_line."
+                },
+                "replace_all": {
+                    "type": "boolean",
+                    "description": "If true, replace ALL occurrences of old_string. Default is false (only first occurrence). Only used in search-and-replace mode."
+                }
+            },
+            "required": ["path", "new_string"]
+        })
+    }
+
+    fn execute(&self, args: &Value) -> Result<String, String> {
+        let path = args
+            .get("path")
+            .and_then(|p| p.as_str())
+            .ok_or("Missing 'path' argument")?;
+
+        let new_string = args
+            .get("new_string")
+            .and_then(|s| s.as_str())
+            .ok_or("Missing 'new_string' argument")?;
+
+        let expanded_path = shellexpand::tilde(path);
+        let file_path = Path::new(expanded_path.as_ref());
+
+        if !file_path.exists() {
+            return Err(format!("File not found: {}", path));
+        }
+
+        let content = fs::read_to_string(file_path)
+            .map_err(|e| format!("Failed to read file '{}': {}", path, e))?;
+
+        let old_string = args.get("old_string").and_then(|s| s.as_str());
+        let start_line = args.get("start_line").and_then(|n| n.as_u64()).map(|n| n as usize);
+        let end_line = args.get("end_line").and_then(|n| n.as_u64()).map(|n| n as usize);
+
+        let new_content = if let Some(old_str) = old_string {
+            // Search-and-replace mode
+            if old_str == new_string {
+                return Err("old_string and new_string are identical — no change needed.".to_string());
+            }
+
+            if !content.contains(old_str) {
+                // Provide helpful diagnostics
+                let trimmed = old_str.trim();
+                if !trimmed.is_empty() && content.contains(trimmed) {
+                    return Err(format!(
+                        "Exact match not found for old_string, but a match was found ignoring leading/trailing whitespace. \
+                         Make sure old_string matches the file content exactly, including indentation. \
+                         Use read_file to see the exact content."
+                    ));
+                }
+                return Err(format!(
+                    "old_string not found in '{}'. Use read_file to verify the exact content you want to replace.",
+                    path
+                ));
+            }
+
+            let replace_all = args
+                .get("replace_all")
+                .and_then(|b| b.as_bool())
+                .unwrap_or(false);
+
+            if replace_all {
+                let count = content.matches(old_str).count();
+                let result = content.replace(old_str, new_string);
+                fs::write(file_path, &result)
+                    .map_err(|e| format!("Failed to write file '{}': {}", path, e))?;
+                return Ok(format!(
+                    "Replaced all {} occurrence(s) of the specified text in '{}'.",
+                    count, path
+                ));
+            } else {
+                let count = content.matches(old_str).count();
+                let result = content.replacen(old_str, new_string, 1);
+                fs::write(file_path, &result)
+                    .map_err(|e| format!("Failed to write file '{}': {}", path, e))?;
+                if count > 1 {
+                    return Ok(format!(
+                        "Replaced first occurrence of the specified text in '{}'. Note: {} total occurrences exist; use replace_all=true to replace all.",
+                        path, count
+                    ));
+                }
+                return Ok(format!("Replaced the specified text in '{}'.", path));
+            }
+        } else if let (Some(start), Some(end)) = (start_line, end_line) {
+            // Line-range mode
+            let lines: Vec<&str> = content.lines().collect();
+            let total_lines = lines.len();
+
+            if start == 0 || end == 0 {
+                return Err("Line numbers are 1-indexed. Use start_line >= 1 and end_line >= 1.".to_string());
+            }
+            if start > total_lines {
+                return Err(format!(
+                    "start_line {} exceeds file length ({} lines).",
+                    start, total_lines
+                ));
+            }
+            if end > total_lines {
+                return Err(format!(
+                    "end_line {} exceeds file length ({} lines).",
+                    end, total_lines
+                ));
+            }
+            if start > end {
+                return Err(format!(
+                    "start_line ({}) must be <= end_line ({}).",
+                    start, end
+                ));
+            }
+
+            // Build new content: lines before range + new text + lines after range
+            let mut result = String::new();
+
+            // Lines before the range (0-indexed: 0..start-1)
+            for line in &lines[..start - 1] {
+                result.push_str(line);
+                result.push('\n');
+            }
+
+            // Insert new content
+            if !new_string.is_empty() {
+                result.push_str(new_string);
+                if !new_string.ends_with('\n') {
+                    result.push('\n');
+                }
+            }
+
+            // Lines after the range (0-indexed: end..)
+            for (i, line) in lines[end..].iter().enumerate() {
+                result.push_str(line);
+                // Add newline for all but potentially the last line,
+                // preserving whether original file ended with newline
+                if end + i + 1 < total_lines || content.ends_with('\n') {
+                    result.push('\n');
+                }
+            }
+
+            result
+        } else {
+            return Err(
+                "Must provide either 'old_string' (search-and-replace mode) or both 'start_line' and 'end_line' (line-range mode).".to_string()
+            );
+        };
+
+        let lines_before = content.lines().count();
+        let lines_after = new_content.lines().count();
+
+        fs::write(file_path, &new_content)
+            .map_err(|e| format!("Failed to write file '{}': {}", path, e))?;
+
+        let diff = lines_after as i64 - lines_before as i64;
+        let diff_str = if diff > 0 {
+            format!("+{} lines", diff)
+        } else if diff < 0 {
+            format!("{} lines", diff)
+        } else {
+            "same line count".to_string()
+        };
+
+        Ok(format!(
+            "Edited '{}': {} lines -> {} lines ({}).",
+            path, lines_before, lines_after, diff_str
+        ))
     }
 }
 
