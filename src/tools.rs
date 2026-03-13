@@ -103,7 +103,7 @@ impl Tool for ReadFileTool {
     }
 
     fn description(&self) -> &'static str {
-        "Read the contents of a file at the given path. Output includes line numbers (e.g. '  42: code here') which can be used with edit_file's line-range mode. Supports chunked reading with offset/limit, and case-insensitive string search with context."
+        "Read the contents of a file at the given path. Always reads the entire file. Output includes line numbers (e.g. '  42: code here') which can be used with edit_file's line-range mode. Optionally supports case-insensitive string search to return only matching lines with context."
     }
 
     fn parameters(&self) -> Value {
@@ -114,21 +114,9 @@ impl Tool for ReadFileTool {
                     "type": "string",
                     "description": "The path to the file to read"
                 },
-                "offset": {
-                    "type": "integer",
-                    "description": "Starting line number (1-indexed). If not specified, starts from line 1."
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": "Maximum number of lines to read. If not specified, reads all remaining lines."
-                },
                 "search": {
                     "type": "string",
                     "description": "Case-insensitive string to search for. Returns only matching lines with surrounding context."
-                },
-                "context_lines": {
-                    "type": "integer",
-                    "description": "Number of lines to show before and after each search match (default: 3). Only used with 'search'."
                 }
             },
             "required": ["path"]
@@ -156,10 +144,7 @@ impl Tool for ReadFileTool {
 
         // Handle search mode
         if let Some(search_term) = args.get("search").and_then(|s| s.as_str()) {
-            let context = args
-                .get("context_lines")
-                .and_then(|c| c.as_u64())
-                .unwrap_or(6) as usize;
+            let context: usize = 6;
 
             let search_lower = search_term.to_lowercase();
             let mut matches: Vec<(usize, &str)> = Vec::new();
@@ -206,36 +191,10 @@ impl Tool for ReadFileTool {
             return Ok(result);
         }
 
-        // Handle chunked reading mode
-        let offset = args
-            .get("offset")
-            .and_then(|o| o.as_u64())
-            .map(|o| (o.saturating_sub(1)) as usize) // Convert to 0-indexed
-            .unwrap_or(0);
-
-        let limit = args
-            .get("limit")
-            .and_then(|l| l.as_u64())
-            .map(|l| l as usize);
-
-        if offset >= total_lines {
-            return Ok(format!("Offset {} exceeds file length ({} lines)", offset + 1, total_lines));
-        }
-
-        let end = match limit {
-            Some(l) => (offset + l).min(total_lines),
-            None => total_lines,
-        };
-
+        // Full file read — large outputs are offloaded to /tmp by the caller
         let mut result = String::new();
-
-        // Add header with line range info if using chunked reading
-        if offset > 0 || limit.is_some() {
-            result.push_str(&format!("Lines {}-{} of {} total:\n\n", offset + 1, end, total_lines));
-        }
-
-        for (idx, line) in lines[offset..end].iter().enumerate() {
-            let line_num = offset + idx + 1; // 1-indexed
+        for (idx, line) in lines.iter().enumerate() {
+            let line_num = idx + 1; // 1-indexed
             result.push_str(&format!("{:>4}: {}\n", line_num, line));
         }
 
