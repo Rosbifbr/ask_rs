@@ -418,12 +418,24 @@ impl Tool for WebPageReaderTool {
             .call()
             .map_err(|e| format!("Failed to fetch page: {}", e))?;
 
-        let body = response.into_string()
+        let mut body = response.into_string()
             .map_err(|e| format!("Failed to read page body: {}", e))?;
 
-        // 2. Convert HTML to Readable Text
-        // width: 80 is standard for readability, usually fits nicely in context windows
-        let clean_text = html2text::from_read(body.as_bytes(), 80);
+        // Limit the payload size to avoid scraper hanging on massive documents
+        let max_body_len = 200_000;
+        if body.len() > max_body_len {
+            body.truncate(max_body_len);
+        }
+
+        // 2. Convert HTML to Readable Text using scraper
+        let document = scraper::Html::parse_document(&body);
+        let clean_text = document
+            .root_element()
+            .text()
+            .map(|t| t.trim())
+            .filter(|t| !t.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
 
         // Optional: Truncate if the page is massive to prevent context overflow
         // e.g., take the first 10,000 characters
