@@ -267,7 +267,7 @@ impl Tool for WebSearchTool {
     }
 
     fn description(&self) -> &'static str {
-        "Search the web using DuckDuckGo. Returns a list of relevant URLs with titles and snippets. Use this to find sources, then use web_read_page to read the content."
+        "Search the web using DuckDuckGo. Returns a list of relevant URLs with titles and snippets. Use this to find sources, but DO NOT STOP THERE. Use web_read_page to then delve into content you find relevant."
     }
 
     fn parameters(&self) -> Value {

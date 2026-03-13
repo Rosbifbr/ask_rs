@@ -173,7 +173,7 @@ fn perform_request_loop(
 
                         let result = tool_registry.execute(tool_name, &args);
                         let result_content = match result {
-                            Ok(output) => handle_large_tool_output(tool_name, output),
+                            Ok(output) => handle_tool_output(tool_name, output),
                             Err(err) => format!("Error: {}", err),
                         };
 
@@ -564,7 +564,13 @@ fn convert_message_to_gemini(msg: &Message) -> Value {
 
 /// Handle potentially large tool output by writing to temp file if needed
 /// Returns the content to use in the tool result message
-fn handle_large_tool_output(tool_name: &str, output: String) -> String {
+fn handle_tool_output(tool_name: &str, output: String) -> String {
+    // Log first 100 lines of result for user context 
+    for line in output.lines().take(100) {
+        eprintln!("[Tool Output] {}", line);
+    }
+
+    // Normal outputs are simply reutrned
     if output.len() <= LARGE_OUTPUT_THRESHOLD {
         return output;
     }
