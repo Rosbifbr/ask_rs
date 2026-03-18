@@ -86,6 +86,7 @@ pub fn create_default_registry() -> ToolRegistry {
     registry.register(Box::new(EditFileTool));
     registry.register(Box::new(WebSearchTool));
     registry.register(Box::new(WebPageReaderTool));
+    registry.register(Box::new(WebFetchRawTool));
     registry.register(Box::new(SearchFilesTool));
     registry.register(Box::new(ExecuteCommandTool));
     registry
@@ -350,7 +351,11 @@ impl Tool for WebPageReaderTool {
     }
 
     fn description(&self) -> &'static str {
-        "Reads the full content of a specific webpage URL. Use this after web_search to get the details of a chosen result."
+        "Reads the main content of a webpage, extracting clean readable text. \
+         Use this after web_search to read a result. Prefers blog posts, docs, and forum threads — \
+         JavaScript-heavy pages (GitHub, SPAs) may return little or nothing. \
+         If this tool returns a WARNING about no structured content and you absolutely need \
+         the raw HTML of that page, use web_fetch_raw instead."
     }
 
     fn parameters(&self) -> Value {
@@ -386,24 +391,139 @@ impl Tool for WebPageReaderTool {
             body.truncate(max_body_len);
         }
 
-        // 2. Convert HTML to Readable Text using scraper
+        // 2. DOM leaf-content extraction
+        //
+        // Strategy: select semantic content-atom tags (p, li, h1-h6, etc.) and keep
+        // only those with no block-level children (true leaf nodes) and enough text.
+        // This works regardless of accessibility markup — Reddit comments, forum posts,
+        // docs, blogs all expose their content through these tags deep in the tree.
+        //
+        // Attributes are discarded entirely (we only call .text()), so no HTML noise
+        // reaches the model. script/style are excluded by tag name.
         let document = scraper::Html::parse_document(&body);
-        let clean_text = document
-            .root_element()
-            .text()
-            .map(|t| t.trim())
-            .filter(|t| !t.is_empty())
-            .collect::<Vec<_>>()
-            .join(" ");
 
-        // Optional: Truncate if the page is massive to prevent context overflow
-        // e.g., take the first 10,000 characters
-        let max_len = 10_000;
-        if clean_text.len() > max_len {
-            Ok(format!("{}...\n\n(Content truncated)", &clean_text[..max_len]))
-        } else {
-            Ok(clean_text)
+        // Tags that carry visible content and are naturally leaf-level in good HTML
+        let sel_atoms = scraper::Selector::parse(
+            "p, li, td, th, dt, dd, h1, h2, h3, h4, h5, h6, blockquote, pre, figcaption, caption, span"
+        ).unwrap();
+
+        // Block-level tags — if an atom contains one of these it isn't really a leaf
+        const BLOCK_CHILDREN: &[&str] = &[
+            "p", "div", "section", "article", "main", "aside", "header", "footer",
+            "nav", "ul", "ol", "dl", "table", "form", "blockquote", "figure",
+            "h1", "h2", "h3", "h4", "h5", "h6", "pre", "li", "tr",
+        ];
+
+        // Ancestors that mean "this is UI chrome, not content"
+        const SKIP_ANCESTORS: &[&str] = &["script", "style", "noscript", "template", "svg", "iframe"];
+
+        let blocks: Vec<String> = document
+            .select(&sel_atoms)
+            // drop anything nested inside non-content ancestors
+            .filter(|el| {
+                !el.ancestors()
+                    .filter_map(scraper::ElementRef::wrap)
+                    .any(|a| SKIP_ANCESTORS.contains(&a.value().name()))
+            })
+            // keep only leaf-ish nodes: no block-level element children
+            .filter(|el| {
+                !el.children()
+                    .filter_map(scraper::ElementRef::wrap)
+                    .any(|child| BLOCK_CHILDREN.contains(&child.value().name()))
+            })
+            // collapse whitespace
+            .map(|el| el.text().collect::<Vec<_>>().join(" "))
+            .map(|s| s.split_whitespace().collect::<Vec<_>>().join(" "))
+            // drop short fragments (nav links, button labels, etc.)
+            .filter(|s| s.len() >= 80)
+            .collect();
+
+        if blocks.is_empty() {
+            // Fall back to raw text dump so the agent can still recover if this
+            // page is the only viable source. Warn clearly so it knows what it's getting.
+            let raw = document
+                .root_element()
+                .text()
+                .map(|t| t.trim())
+                .filter(|t| !t.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+
+            let raw_capped = if raw.len() > 5_000 { &raw[..5_000] } else { &raw };
+
+            return Ok(format!(
+                "WARNING: No structured content could be extracted from this page \
+                 (it likely requires JavaScript to render). \
+                 A raw text dump follows — it will be noisy and may include menus, \
+                 scripts, and boilerplate. Only use this if the information here is \
+                 critical and unavailable elsewhere; otherwise, try a blog post, \
+                 documentation page, or forum thread from your search results instead.\n\n\
+                 --- RAW DUMP ---\n{raw_capped}"
+            ));
         }
+
+        let result_text = blocks.join("\n\n");
+
+        let max_len = 10_000;
+        if result_text.len() > max_len {
+            Ok(format!("{}...\n\n(Content truncated at 10k chars — if you need more, search for a more specific page.)", &result_text[..max_len]))
+        } else {
+            Ok(result_text)
+        }
+    }
+}
+
+pub struct WebFetchRawTool;
+
+impl Tool for WebFetchRawTool {
+    fn name(&self) -> &'static str {
+        "web_fetch_raw"
+    }
+
+    fn description(&self) -> &'static str {
+        "Fetches the raw HTTP response body of a URL as plain text (GET only). \
+         Use this as a last resort when web_read_page returns a WARNING about no structured content \
+         and the page is the only viable source of critical information. \
+         The output will be noisy HTML — scan it carefully for what you need. \
+         Do NOT use this as a first step; always try web_read_page first."
+    }
+
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "The URL to fetch (must be http:// or https://)"
+                }
+            },
+            "required": ["url"]
+        })
+    }
+
+    fn execute(&self, args: &Value) -> Result<String, String> {
+        let url = args.get("url")
+            .and_then(|u| u.as_str())
+            .ok_or("Missing 'url' argument")?;
+
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            return Err("Only http:// and https:// URLs are allowed.".to_string());
+        }
+
+        let mut body = ureq::get(url)
+            .set("User-Agent", "Mozilla/5.0 (compatible; ask-rs/1.0)")
+            .call()
+            .map_err(|e| format!("Fetch failed: {}", e))?
+            .into_string()
+            .map_err(|e| format!("Failed to read response: {}", e))?;
+
+        let max_len = 15_000;
+        if body.len() > max_len {
+            body.truncate(max_len);
+            body.push_str("\n\n(Truncated at 15k chars)");
+        }
+
+        Ok(body)
     }
 }
 
