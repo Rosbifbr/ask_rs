@@ -12,3 +12,4 @@ scraper = "0.18"      # For parsing HTML (Search Tool)
 base64 = "0.21"
 shellexpand = "3.1"
 urlencoding = "2.1"
+libc = "0.2"

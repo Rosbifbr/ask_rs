@@ -26,6 +26,7 @@ name = "ask_rs"
 version = "0.5.0"
 dependencies = [
  "base64 0.21.7",
+ "libc",
  "scraper",
  "serde",
  "serde_json",

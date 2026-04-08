@@ -6,7 +6,7 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
-use std::io::{self, Write};
+use std::io::{self, Read as IoRead, Write};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Message {
@@ -48,16 +48,39 @@ pub fn prompt_select(prompt: &str, items: &[String]) -> usize {
         println!("{}. {}", i + 1, item);
     }
     loop {
-        print!("Select an option (1-{}): ", items.len());
+        print!("(1-{}): ", items.len());
         io::stdout().flush().unwrap();
-        let mut buffer = String::new();
-        io::stdin().read_line(&mut buffer).unwrap();
-        if let Ok(n) = buffer.trim().parse::<usize>() {
+        if let Some(n) = read_single_digit() {
             if n > 0 && n <= items.len() {
+                println!("{}", n);
                 return n - 1;
             }
         }
-        println!("Invalid selection. Please try again.");
+        println!("\nInvalid selection. Please try again.");
+    }
+}
+
+fn read_single_digit() -> Option<usize> {
+    use std::os::unix::io::AsRawFd;
+    let stdin_fd = io::stdin().as_raw_fd();
+    let orig = unsafe {
+        let mut t: libc::termios = std::mem::zeroed();
+        libc::tcgetattr(stdin_fd, &mut t);
+        t
+    };
+    let mut raw = orig;
+    raw.c_lflag &= !(libc::ICANON | libc::ECHO);
+    raw.c_cc[libc::VMIN] = 1;
+    raw.c_cc[libc::VTIME] = 0;
+    unsafe { libc::tcsetattr(stdin_fd, libc::TCSANOW, &raw) };
+    let mut buf = [0u8; 1];
+    let result = io::stdin().lock().read_exact(&mut buf);
+    unsafe { libc::tcsetattr(stdin_fd, libc::TCSANOW, &orig) };
+    if result.is_ok() {
+        let ch = buf[0] as char;
+        ch.to_digit(10).map(|d| d as usize)
+    } else {
+        None
     }
 }
 
@@ -179,7 +202,7 @@ pub fn delete_all_files_action(settings: &Settings) {
 }
 
 pub fn manage_ongoing_convos(
-    current_convo: &mut ConversationState, // Corrected: typo was ¤t_convo
+    current_convo: &mut ConversationState,
     current_transcript_path: &PathBuf,
     settings: &Settings,
 ) {
@@ -236,103 +259,155 @@ pub fn manage_ongoing_convos(
         })
         .collect();
 
-    options.insert(0, ">>> Delete All Conversations".to_string());
+    options.push(">>> Change Provider".to_string());
 
-    let index = prompt_select("Select an option to manage", &options);
+    let index = prompt_select("Select a conversation to manage", &options);
 
-    if index == 0 {
-            delete_all_files_action(settings);
-            if current_transcript_path.exists() {
-                let current_filename = current_transcript_path
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy();
-                if files.iter().any(|f| {
-                    f.file_name().unwrap_or_default().to_string_lossy() == current_filename
-                }) {
-                    // Current convo was deleted
-                }
-            }
-            return;
+    // Last option is "Change Provider"
+    if index == options.len() - 1 {
+        change_provider(settings);
+        return;
     }
 
-    let selected_file_index = index - 1;
-    if selected_file_index >= files.len() {
+    if index >= files.len() {
         println!("Invalid selection.");
         return;
     }
-    let selected_file = &files[selected_file_index];
+    let selected_file = &files[index];
 
     let action_index = prompt_select(
         &format!(
             "Action for {}:",
             selected_file.file_name().unwrap_or_default().to_string_lossy()
         ),
-        &["Delete".to_string(), "Copy to Current Conversation".to_string(), "Cancel".to_string()]
+        &[
+            "Move to this shell".to_string(),
+            "Copy to this shell".to_string(),
+            "Delete".to_string(),
+        ],
     );
 
     match action_index {
         0 => {
+            // Move: copy messages then delete source
+            merge_conversation(current_convo, current_transcript_path, selected_file, settings);
             if let Err(e) = fs::remove_file(selected_file) {
-                println!("Failed to delete conversation: {}", e);
+                eprintln!("Failed to delete source conversation: {}", e);
             } else {
-                println!(
-                    "Conversation {} deleted successfully.",
-                    selected_file.display()
-                );
+                println!("Conversation moved to current session.");
             }
         }
         1 => {
-            let data = fs::read_to_string(selected_file).unwrap_or_default();
-            match serde_json::from_str::<ConversationState>(&data) {
-                Ok(convo_to_copy) => {
-                    if convo_to_copy.model != current_convo.model {
-                        // Corrected: current_convo
-                        println!(
-                            "Cannot copy conversation: Model mismatch (current: {}, selected: {}).",
-                            current_convo.model, convo_to_copy.model // Corrected: current_convo
-                        );
-                        return;
-                    }
-                    let current_messages_is_empty = current_convo.messages.is_empty(); // Evaluate before closure
-                    let messages_to_add =
-                        convo_to_copy.messages.into_iter().skip_while(|msg| {
-                            !current_messages_is_empty
-                                && (msg.role == "system"
-                                    || (msg
-                                        .content
-                                        .as_str()
-                                        .map_or(false, |s| s == settings.startup_message)))
-                        });
-                    current_convo.messages.extend(messages_to_add);
-
-                    match serde_json::to_string_pretty(current_convo) {
-                        Ok(conversation_json) => {
-                            if let Err(e) =
-                                fs::write(current_transcript_path, conversation_json)
-                            {
-                                eprintln!("Unable to write updated transcript file: {}", e);
-                            } else {
-                                println!(
-                                    "Conversation copied to current session successfully."
-                                );
-                            }
-                        }
-                        Err(e) => eprintln!("Could not serialize conversation to JSON: {}", e),
-                    }
-                }
-                Err(e) => {
-                    eprintln!(
-                        "Could not parse selected conversation file {}: {}",
-                        selected_file.display(),
-                        e
-                    );
-                }
+            // Copy: keep source
+            merge_conversation(current_convo, current_transcript_path, selected_file, settings);
+            println!("Conversation copied to current session.");
+        }
+        2 => {
+            if let Err(e) = fs::remove_file(selected_file) {
+                println!("Failed to delete conversation: {}", e);
+            } else {
+                println!("Conversation deleted.");
             }
         }
-        _ => {
-            println!("Action cancelled.");
+        _ => {}
+    }
+}
+
+fn merge_conversation(
+    current_convo: &mut ConversationState,
+    current_transcript_path: &PathBuf,
+    source_file: &PathBuf,
+    settings: &Settings,
+) {
+    let data = fs::read_to_string(source_file).unwrap_or_default();
+    match serde_json::from_str::<ConversationState>(&data) {
+        Ok(convo_to_copy) => {
+            if convo_to_copy.model != current_convo.model {
+                println!(
+                    "Cannot merge: Model mismatch (current: {}, selected: {}).",
+                    current_convo.model, convo_to_copy.model
+                );
+                return;
+            }
+            let current_messages_is_empty = current_convo.messages.is_empty();
+            let messages_to_add = convo_to_copy.messages.into_iter().skip_while(|msg| {
+                !current_messages_is_empty
+                    && (msg.role == "system"
+                        || (msg
+                            .content
+                            .as_str()
+                            .map_or(false, |s| s == settings.startup_message)))
+            });
+            current_convo.messages.extend(messages_to_add);
+
+            match serde_json::to_string_pretty(current_convo) {
+                Ok(conversation_json) => {
+                    if let Err(e) = fs::write(current_transcript_path, conversation_json) {
+                        eprintln!("Unable to write updated transcript file: {}", e);
+                    }
+                }
+                Err(e) => eprintln!("Could not serialize conversation to JSON: {}", e),
+            }
         }
+        Err(e) => {
+            eprintln!(
+                "Could not parse selected conversation file {}: {}",
+                source_file.display(),
+                e
+            );
+        }
+    }
+}
+
+fn change_provider(settings: &Settings) {
+    let settings_path = env::var("HOME")
+        .map(|home| format!("{}/.config/ask.json", home))
+        .unwrap_or_else(|_| ".config/ask.json".to_string());
+
+    let provider_names: Vec<String> = settings.providers.keys().cloned().collect();
+    if provider_names.is_empty() {
+        println!("No providers configured.");
+        return;
+    }
+
+    let options: Vec<String> = provider_names
+        .iter()
+        .map(|name| {
+            let p = &settings.providers[name];
+            let current = if *name == settings.provider { " (current)" } else { "" };
+            format!("{}{} [{}]", name, current, p.model)
+        })
+        .collect();
+
+    let index = prompt_select("Select provider", &options);
+    let chosen = &provider_names[index];
+
+    if *chosen == settings.provider {
+        println!("Already using {}.", chosen);
+        return;
+    }
+
+    // Read the config file, update provider field, write back
+    match fs::read_to_string(&settings_path) {
+        Ok(contents) => {
+            match serde_json::from_str::<serde_json::Value>(&contents) {
+                Ok(mut json) => {
+                    json["provider"] = serde_json::Value::String(chosen.clone());
+                    match serde_json::to_string_pretty(&json) {
+                        Ok(updated) => {
+                            if let Err(e) = fs::write(&settings_path, updated) {
+                                eprintln!("Failed to write config: {}", e);
+                            } else {
+                                println!("Provider changed to {}.", chosen);
+                            }
+                        }
+                        Err(e) => eprintln!("Failed to serialize config: {}", e),
+                    }
+                }
+                Err(e) => eprintln!("Failed to parse config: {}", e),
+            }
+        }
+        Err(e) => eprintln!("Failed to read config file: {}", e),
     }
 }
 
