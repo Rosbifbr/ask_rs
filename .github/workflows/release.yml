@@ -4,24 +4,51 @@ on:
     branches:
       - master
 jobs:
-  release:
-    runs-on: ubuntu-latest
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact_name: ask_rs-linux-x86_64
+            binary_path: target/release/ask_rs
+          - os: macos-latest
+            artifact_name: ask_rs-macos-arm64
+            binary_path: target/release/ask_rs
+    runs-on: ${{ matrix.os }}
     permissions:
-      contents: write
+      contents: read
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
       - name: Build release binary
         run: cargo build --release
       - name: Strip binary
-        run: strip target/release/ask_rs
+        run: strip "${{ matrix.binary_path }}"
+      - name: Prepare artifact
+        run: cp "${{ matrix.binary_path }}" "${{ matrix.artifact_name }}"
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_name }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
       - name: Create GitHub Release
-        id: create_release
         uses: ncipollo/release-action@v1
         with:
           tag: v${{ github.run_number }}
           name: Release ${{ github.run_number }}
-          artifacts: "target/release/ask_rs"
+          artifacts: "release-assets/*"
           body: |
             Automated release from master on run ${{ github.run_number }}
           draft: false
