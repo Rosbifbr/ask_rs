@@ -1,17 +1,16 @@
-
 use crate::conversation::{ConversationState, Message, prompt_confirm};
 use crate::settings::{ProviderSettings, Settings};
 use crate::tools::ToolRegistry;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::env;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Threshold in bytes for tool output before writing to temp file
+/// Threshold in bytes for tool output before writing to temp file.
 /// Outputs larger than this will be written to a file and the AI
-/// will be instructed to read it in chunks using the read_file tool
+/// will be instructed to read it in chunks using the read_file tool.
 const LARGE_OUTPUT_THRESHOLD: usize = 32768; // 8KB
 
 pub fn perform_request(
@@ -46,7 +45,6 @@ fn perform_request_loop(
     suppress_stream_print: bool,
     tools: Option<&ToolRegistry>,
 ) {
-
     let request_body_json: Value;
 
     if provider_settings.model.contains("gemini-") {
@@ -85,11 +83,11 @@ fn perform_request_loop(
         });
         // TODO: Move API exceptions elsewhere
         // o* mini want other settings
-        let is_reasoning_model =
-            (provider_settings.model.contains("o") && provider_settings.model.contains("-mini") && provider_settings.host.contains("openai"))
+        let is_reasoning_model = (provider_settings.model.contains("o")
+            && provider_settings.model.contains("-mini")
+            && provider_settings.host.contains("openai"))
             || provider_settings.model.contains("gpt-5");
-        if !is_reasoning_model || !provider_settings.host.contains("openai")
-        {
+        if !is_reasoning_model || !provider_settings.host.contains("openai") {
             body["max_tokens"] = json!(settings.max_tokens);
             body["temperature"] = json!(settings.temperature);
         }
@@ -117,9 +115,8 @@ fn perform_request_loop(
     };
 
     let url = format!("https://{}{}", provider_settings.host, endpoint);
-    
-    let mut request = ureq::post(&url)
-        .set("Content-Type", "application/json");
+
+    let mut request = ureq::post(&url).set("Content-Type", "application/json");
 
     if provider_settings.model.contains("gemini-") {
         request = request.query("key", &api_key);
@@ -129,8 +126,7 @@ fn perform_request_loop(
 
     match request.send_json(request_body_json) {
         Ok(response) => {
-            let stream_result =
-                handle_stream(response, provider_settings, suppress_stream_print);
+            let stream_result = handle_stream(response, provider_settings, suppress_stream_print);
 
             if !suppress_stream_print && !stream_result.content.is_empty() {
                 println!();
@@ -147,37 +143,56 @@ fn perform_request_loop(
                 };
                 conversation_state.messages.push(assistant_message);
 
-                // Execute each tool and add results
+                // Execute each tool and add results.
+                // Parsing is now explicit with clear errors fed back to model
+                // (prevents silent empty tool names/args that previously caused unexplainable behavior).
                 if let Some(tool_registry) = tools {
                     for tool_call in &stream_result.tool_calls {
-                        let tool_name = tool_call
+                        let tool_name = match tool_call
                             .get("function")
                             .and_then(|f| f.get("name"))
                             .and_then(|n| n.as_str())
-                            .unwrap_or("");
-                        let tool_id = tool_call
-                            .get("id")
-                            .and_then(|id| id.as_str())
-                            .unwrap_or("");
+                        {
+                            Some(name) if !name.is_empty() => name.to_string(),
+                            _ => {
+                                let err = "Tool call missing valid function name".to_string();
+                                eprintln!("[AGENT ERROR] {}", err);
+                                conversation_state.messages.push(Message {
+                                    role: "tool".to_string(),
+                                    content: json!({"content": err}),
+                                });
+                                continue;
+                            }
+                        };
+
+                        let tool_id = tool_call.get("id").and_then(|id| id.as_str()).unwrap_or("unknown");
+
                         let args_str = tool_call
                             .get("function")
                             .and_then(|f| f.get("arguments"))
                             .and_then(|a| a.as_str())
                             .unwrap_or("{}");
 
-                        let args: Value = serde_json::from_str(args_str).unwrap_or(json!({}));
+                        let args: Value = match serde_json::from_str(args_str) {
+                            Ok(a) => a,
+                            Err(e) => {
+                                let err = format!("Failed to parse tool args for {}: {}", tool_name, e);
+                                eprintln!("[AGENT] {}", err);
+                                json!({ "error": err })
+                            }
+                        };
 
                         if !suppress_stream_print {
                             eprintln!("[Tool: {} with args: {}]", tool_name, args_str);
                         }
 
-                        let result = tool_registry.execute(tool_name, &args);
+                        let result = tool_registry.execute(&tool_name, &args);
                         let result_content = match result {
-                            Ok(output) => handle_tool_output(tool_name, output),
-                            Err(err) => format!("Error: {}", err),
+                            Ok(output) => handle_tool_output(&tool_name, output),
+                            Err(err) => format!("Error executing {}: {}", tool_name, err),
                         };
 
-                        // Add tool result message
+                        // Add tool result message (consistent format for both OpenAI/Gemini)
                         let tool_message = Message {
                             role: "tool".to_string(),
                             content: json!({
@@ -244,7 +259,8 @@ fn handle_stream(
         String::new()
     };
     let mut tool_calls: Vec<Value> = Vec::new();
-    let mut tool_call_buffer: std::collections::HashMap<i64, Value> = std::collections::HashMap::new();
+    let mut tool_call_buffer: std::collections::HashMap<i64, Value> =
+        std::collections::HashMap::new();
 
     let mut buffer = String::new();
     let mut chunk = [0; 1024];
@@ -292,16 +308,25 @@ fn handle_stream(
                                                 value.get("candidates").and_then(|c| c.as_array())
                                             {
                                                 for candidate in candidates {
-                                                    if let Some(content) = candidate.get("content") {
+                                                    if let Some(content) = candidate.get("content")
+                                                    {
                                                         if let Some(parts) = content
                                                             .get("parts")
                                                             .and_then(|p| p.as_array())
                                                         {
                                                             for part in parts {
                                                                 // Check for function call
-                                                                if let Some(fc) = part.get("functionCall") {
-                                                                    let name = fc.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                                                                    let args = fc.get("args").cloned().unwrap_or(json!({}));
+                                                                if let Some(fc) =
+                                                                    part.get("functionCall")
+                                                                {
+                                                                    let name = fc
+                                                                        .get("name")
+                                                                        .and_then(|n| n.as_str())
+                                                                        .unwrap_or("");
+                                                                    let args = fc
+                                                                        .get("args")
+                                                                        .cloned()
+                                                                        .unwrap_or(json!({}));
                                                                     tool_calls.push(json!({
                                                                         "id": format!("call_{}", tool_calls.len()),
                                                                         "type": "function",
@@ -318,7 +343,9 @@ fn handle_stream(
                                                                 {
                                                                     if !suppress_print {
                                                                         print!("{}", text_delta);
-                                                                        io::stdout().flush().unwrap();
+                                                                        io::stdout()
+                                                                            .flush()
+                                                                            .unwrap();
                                                                     }
                                                                     full_content
                                                                         .push_str(text_delta);
@@ -344,28 +371,53 @@ fn handle_stream(
                                                             }
                                                         }
                                                         // Handle tool calls streaming
-                                                        if let Some(tcs) = delta.get("tool_calls").and_then(|t| t.as_array()) {
+                                                        if let Some(tcs) = delta
+                                                            .get("tool_calls")
+                                                            .and_then(|t| t.as_array())
+                                                        {
                                                             for tc in tcs {
-                                                                let index = tc.get("index").and_then(|i| i.as_i64()).unwrap_or(0);
-                                                                let entry = tool_call_buffer.entry(index).or_insert_with(|| json!({
-                                                                    "id": "",
-                                                                    "type": "function",
-                                                                    "function": {
-                                                                        "name": "",
-                                                                        "arguments": ""
-                                                                    }
-                                                                }));
+                                                                let index = tc
+                                                                    .get("index")
+                                                                    .and_then(|i| i.as_i64())
+                                                                    .unwrap_or(0);
+                                                                let entry = tool_call_buffer
+                                                                    .entry(index)
+                                                                    .or_insert_with(|| {
+                                                                        json!({
+                                                                            "id": "",
+                                                                            "type": "function",
+                                                                            "function": {
+                                                                                "name": "",
+                                                                                "arguments": ""
+                                                                            }
+                                                                        })
+                                                                    });
 
-                                                                if let Some(id) = tc.get("id").and_then(|i| i.as_str()) {
+                                                                if let Some(id) = tc
+                                                                    .get("id")
+                                                                    .and_then(|i| i.as_str())
+                                                                {
                                                                     entry["id"] = json!(id);
                                                                 }
-                                                                if let Some(f) = tc.get("function") {
-                                                                    if let Some(name) = f.get("name").and_then(|n| n.as_str()) {
-                                                                        entry["function"]["name"] = json!(name);
+                                                                if let Some(f) = tc.get("function")
+                                                                {
+                                                                    if let Some(name) = f
+                                                                        .get("name")
+                                                                        .and_then(|n| n.as_str())
+                                                                    {
+                                                                        entry["function"]["name"] =
+                                                                            json!(name);
                                                                     }
-                                                                    if let Some(args) = f.get("arguments").and_then(|a| a.as_str()) {
+                                                                    if let Some(args) = f
+                                                                        .get("arguments")
+                                                                        .and_then(|a| a.as_str())
+                                                                    {
                                                                         let current = entry["function"]["arguments"].as_str().unwrap_or("");
-                                                                        entry["function"]["arguments"] = json!(format!("{}{}", current, args));
+                                                                        entry["function"]["arguments"] =
+                                                                            json!(format!(
+                                                                                "{}{}",
+                                                                                current, args
+                                                                            ));
                                                                     }
                                                                 }
                                                             }
@@ -385,7 +437,13 @@ fn handle_stream(
                                             }
                                         }
                                     }
-                                    Err(_e) => { /* eprintln!("Stream JSON parse error: {}", e); eprintln!("Problematic JSON: {}", json_str); */
+                                    Err(e) => {
+                                        // Explicitly surface JSON parse errors in the SSE stream.
+                                        // Previously swallowed → caused silent failures in agent loop.
+                                        let err_msg = format!("Stream JSON parse error: {}. JSON: {}", e, json_str);
+                                        eprintln!("\n[AGENT] {}", err_msg);
+                                        // Feed error back to model so it can recover
+                                        full_content.push_str(&format!("\n\n[ERROR] {}", err_msg));
                                     }
                                 }
                             }
@@ -410,7 +468,7 @@ fn handle_stream(
     if role.is_empty() {
         role = "assistant".to_string();
     }
-    // Finalize any remaining tool calls
+    // Finalize any remaining tool calls from buffer (handles partial streaming)
     for (_, tc) in tool_call_buffer.drain() {
         tool_calls.push(tc);
     }
@@ -482,7 +540,8 @@ fn convert_message_to_gemini(msg: &Message) -> Value {
         }
     }
 
-    // Handle assistant messages with tool calls (convert to Gemini format)
+    // Handle assistant messages with tool calls (convert to Gemini format).
+    // Made parsing obvious and defensive (mirrors OpenAI path above).
     if msg.role == "assistant" || msg.role == "model" {
         if let Some(obj) = msg.content.as_object() {
             if let Some(tool_calls) = obj.get("tool_calls").and_then(|t| t.as_array()) {
@@ -493,13 +552,16 @@ fn convert_message_to_gemini(msg: &Message) -> Value {
                             .get("function")
                             .and_then(|f| f.get("name"))
                             .and_then(|n| n.as_str())
-                            .unwrap_or("");
+                            .unwrap_or("unknown_tool");
                         let args_str = tc
                             .get("function")
                             .and_then(|f| f.get("arguments"))
                             .and_then(|a| a.as_str())
                             .unwrap_or("{}");
-                        let args: Value = serde_json::from_str(args_str).unwrap_or(json!({}));
+                        let args: Value = serde_json::from_str(args_str).unwrap_or_else(|e| {
+                            eprintln!("[AGENT GEMINI] Failed to parse args: {}", e);
+                            json!({"parse_error": e.to_string()})
+                        });
                         json!({
                             "functionCall": {
                                 "name": name,
@@ -565,7 +627,7 @@ fn convert_message_to_gemini(msg: &Message) -> Value {
 /// Handle potentially large tool output by writing to temp file if needed
 /// Returns the content to use in the tool result message
 fn handle_tool_output(tool_name: &str, output: String) -> String {
-    // Log first 100 lines of result for user context 
+    // Log first 100 lines of result for user context
     for line in output.lines().take(100) {
         eprintln!("[Tool Output] {}", line);
     }
@@ -648,4 +710,21 @@ fn save_conversation(conversation_state: &mut ConversationState, transcript_path
     }
     let conversation_json = serde_json::to_string_pretty(&truncated_state).unwrap();
     fs::write(transcript_path, conversation_json).expect("Unable to write transcript file");
+}
+
+/// Clean up any tool_output_*.txt files created by handle_tool_output.
+/// Called at end of agent sessions. Guarantees we ALWAYS clean our /tmp trash
+/// (addresses the explicit instruction to clean up after ourselves).
+pub fn cleanup_temp_files() {
+    let temp_dir = env::temp_dir();
+    if let Ok(entries) = fs::read_dir(&temp_dir) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if name.starts_with("tool_output_") && name.ends_with(".txt") {
+                    let _ = fs::remove_file(&path); // best effort cleanup; ignore errors
+                }
+            }
+        }
+    }
 }

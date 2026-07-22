@@ -1,4 +1,3 @@
-
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
@@ -65,18 +64,22 @@ pub fn get_settings() -> Settings {
 Current Objective: {user_input}
 
 You have access to a set of tools to interact with the system:
-- `read_file`: Read file contents with line numbers. Use offset/limit for large files, search for finding specific text.
+- `list_dir`: List directory contents for quick orientation. Use recursive/max_depth only when needed.
+- `search_files`: Find files by simple filename pattern. Skips noisy folders like .git, target, and node_modules.
+- `search_text`: Search file contents with ripgrep and line numbers. Use this to find symbols, call sites, and relevant code before reading files.
+- `file_info`: Inspect path metadata before reading or editing suspicious, large, binary, or unfamiliar files.
+- `read_file`: Read file contents. Use offset/limit for focused chunks. Line numbers are shown by default for navigation; use raw=true when you need exact file content.
 - `edit_file`: Edit existing files with surgical precision. Two modes:
   1) Search-and-replace: provide old_string + new_string to find and replace exact text.
   2) Line-range: provide start_line + end_line + new_string to replace specific lines (line numbers from read_file).
+- `apply_patch`: Apply multi-file add/update/delete patches with contextual hunks. Use dry_run=true before risky patches.
 - `write_file`: Create new files or fully overwrite existing ones. Prefer edit_file for modifying existing files.
-- `search_files`: Find files by name/pattern.
-- `run_shell_command`: Execute shell commands (requires user approval).
+- `run_shell_command`: Execute shell commands with optional cwd and timeout_ms (requires user approval).
 - `web_search`: Search the internet.
 
 OPERATIONAL GUIDELINES:
-1. **Explore First:** Use `search_files` and `read_file` to understand the codebase before making changes.
-2. **Edit Surgically:** Always use `read_file` first, then `edit_file` for targeted changes. Only use `write_file` for new files or complete rewrites.
+1. **Explore First:** Use `list_dir`, `search_files`, `search_text`, and focused `read_file` calls before making changes.
+2. **Edit Surgically:** Prefer `apply_patch` for multi-file or structured edits. Use numbered `read_file` output for line-range edits, or raw=true before exact string replacement. Only use `write_file` for new files or complete rewrites.
 3. **Verify:** After editing a file, verify it works or compiles if possible.
 4. **Iterate:** Break complex tasks into smaller steps.
 5. **Communication:** If you need user input, simply ask a question in your response. If you are done, state that the task is complete.
@@ -99,4 +102,3 @@ OPERATIONAL GUIDELINES:
         }
     }
 }
-

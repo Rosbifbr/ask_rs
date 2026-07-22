@@ -1,4 +1,3 @@
-
 use crate::settings::Settings;
 use serde_json::Value;
 use std::process::Command as ProcessCommand;
@@ -21,7 +20,9 @@ pub fn detect_clipboard_command(settings: &Settings) -> String {
 
 pub fn add_image_to_pipeline(input: &mut Value, clipboard_command: &str, settings: &Settings) {
     if clipboard_command == settings.clipboard_command_unsupported {
-        eprintln!("Unsupported OS/DE combination for clipboard image. Only Xorg and Wayland are supported via predefined commands.");
+        eprintln!(
+            "Unsupported OS/DE combination for clipboard image. Only Xorg and Wayland are supported via predefined commands."
+        );
         std::process::exit(1);
     }
 
@@ -32,7 +33,10 @@ pub fn add_image_to_pipeline(input: &mut Value, clipboard_command: &str, setting
         .expect("Failed to execute clipboard command");
 
     if output.stdout.is_empty() {
-        eprintln!("Clipboard returned no data. Ensure an image is available on the clipboard. clipboard_command is '{}'", clipboard_command);
+        eprintln!(
+            "Clipboard returned no data. Ensure an image is available on the clipboard. clipboard_command is '{}'",
+            clipboard_command
+        );
         std::process::exit(1);
     }
 
@@ -56,4 +60,3 @@ pub fn add_image_to_pipeline(input: &mut Value, clipboard_command: &str, setting
 
     *input = new_input_content;
 }
-

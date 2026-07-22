@@ -1,12 +1,11 @@
-
 use crate::settings::Settings;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::env;
 use std::fs;
+use std::io::{self, Read as IoRead, Write};
 use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
-use std::io::{self, Read as IoRead, Write};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Message {
@@ -173,13 +172,13 @@ pub fn delete_all_files_action(settings: &Settings) {
             .filter_map(|e| e.ok())
             .map(|e| e.path())
             .filter(|p| {
-                 p.is_file()
-                    && (
-                        p.file_name()
-                            .unwrap_or_default()
-                            .to_string_lossy()
-                            .starts_with(&settings.transcript_name) ||
-                        p.file_name()
+                p.is_file()
+                    && (p
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .starts_with(&settings.transcript_name)
+                        || p.file_name()
                             .unwrap_or_default()
                             .to_string_lossy()
                             .starts_with("tool_output_"))
@@ -227,11 +226,6 @@ pub fn manage_ongoing_convos(
         })
         .collect();
 
-    if files.is_empty() {
-        println!("No conversations to manage!");
-        return;
-    }
-
     let mut options: Vec<String> = files
         .iter()
         .map(|file| {
@@ -259,7 +253,7 @@ pub fn manage_ongoing_convos(
         })
         .collect();
 
-    options.push(">>> Change Provider".to_string());
+    options.insert(0, ">>> Change Provider".to_string());
 
     let index = prompt_select("Select a conversation to manage", &options);
 
@@ -278,7 +272,10 @@ pub fn manage_ongoing_convos(
     let action_index = prompt_select(
         &format!(
             "Action for {}:",
-            selected_file.file_name().unwrap_or_default().to_string_lossy()
+            selected_file
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
         ),
         &[
             "Move to this shell".to_string(),
@@ -290,7 +287,12 @@ pub fn manage_ongoing_convos(
     match action_index {
         0 => {
             // Move: copy messages then delete source
-            merge_conversation(current_convo, current_transcript_path, selected_file, settings);
+            merge_conversation(
+                current_convo,
+                current_transcript_path,
+                selected_file,
+                settings,
+            );
             if let Err(e) = fs::remove_file(selected_file) {
                 eprintln!("Failed to delete source conversation: {}", e);
             } else {
@@ -299,7 +301,12 @@ pub fn manage_ongoing_convos(
         }
         1 => {
             // Copy: keep source
-            merge_conversation(current_convo, current_transcript_path, selected_file, settings);
+            merge_conversation(
+                current_convo,
+                current_transcript_path,
+                selected_file,
+                settings,
+            );
             println!("Conversation copied to current session.");
         }
         2 => {
@@ -374,7 +381,11 @@ fn change_provider(settings: &Settings) {
         .iter()
         .map(|name| {
             let p = &settings.providers[name];
-            let current = if *name == settings.provider { " (current)" } else { "" };
+            let current = if *name == settings.provider {
+                " (current)"
+            } else {
+                ""
+            };
             format!("{}{} [{}]", name, current, p.model)
         })
         .collect();
@@ -389,25 +400,22 @@ fn change_provider(settings: &Settings) {
 
     // Read the config file, update provider field, write back
     match fs::read_to_string(&settings_path) {
-        Ok(contents) => {
-            match serde_json::from_str::<serde_json::Value>(&contents) {
-                Ok(mut json) => {
-                    json["provider"] = serde_json::Value::String(chosen.clone());
-                    match serde_json::to_string_pretty(&json) {
-                        Ok(updated) => {
-                            if let Err(e) = fs::write(&settings_path, updated) {
-                                eprintln!("Failed to write config: {}", e);
-                            } else {
-                                println!("Provider changed to {}.", chosen);
-                            }
+        Ok(contents) => match serde_json::from_str::<serde_json::Value>(&contents) {
+            Ok(mut json) => {
+                json["provider"] = serde_json::Value::String(chosen.clone());
+                match serde_json::to_string_pretty(&json) {
+                    Ok(updated) => {
+                        if let Err(e) = fs::write(&settings_path, updated) {
+                            eprintln!("Failed to write config: {}", e);
+                        } else {
+                            println!("Provider changed to {}.", chosen);
                         }
-                        Err(e) => eprintln!("Failed to serialize config: {}", e),
                     }
+                    Err(e) => eprintln!("Failed to serialize config: {}", e),
                 }
-                Err(e) => eprintln!("Failed to parse config: {}", e),
             }
-        }
+            Err(e) => eprintln!("Failed to parse config: {}", e),
+        },
         Err(e) => eprintln!("Failed to read config file: {}", e),
     }
 }
-
