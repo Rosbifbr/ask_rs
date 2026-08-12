@@ -1,2 +1,6 @@
 /target
 .aider*
+macos/.build
+macos/Ask.app
+.DS_Store
+*.swp
