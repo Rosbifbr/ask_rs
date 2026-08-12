@@ -11,6 +11,8 @@ use std::process::Command as ProcessCommand;
 pub struct Message {
     pub role: String,
     pub content: Value,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub response_items: Vec<Value>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -257,8 +259,8 @@ pub fn manage_ongoing_convos(
 
     let index = prompt_select("Select a conversation to manage", &options);
 
-    // Last option is "Change Provider"
-    if index == options.len() - 1 {
+    // First option is "Change Provider"
+    if index == 0 {
         change_provider(settings);
         return;
     }

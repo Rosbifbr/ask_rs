@@ -25,6 +25,7 @@ pub fn perform_request(
     conversation_state.messages.push(Message {
         role: "user".to_string(),
         content: input,
+        response_items: Vec::new(),
     });
 
     perform_request_loop(
@@ -68,6 +69,23 @@ fn perform_request_loop(
         }
 
         request_body_json = body;
+    } else if provider_settings.uses_responses_api() {
+        let mut body = json!({
+            "input": convert_messages_to_responses(&conversation_state.messages),
+            "model": conversation_state.model,
+            "stream": true,
+            "max_output_tokens": settings.max_tokens
+        });
+
+        apply_reasoning_effort(&mut body, provider_settings);
+        if !is_openai_reasoning_model(provider_settings) {
+            body["temperature"] = json!(settings.temperature);
+        }
+        if let Some(tool_registry) = tools {
+            body["tools"] = json!(tool_registry.to_responses_format());
+        }
+
+        request_body_json = body;
     } else {
         // Convert messages to OpenAI format (handle tool calls/results)
         let openai_messages: Vec<Value> = conversation_state
@@ -83,14 +101,12 @@ fn perform_request_loop(
         });
         // TODO: Move API exceptions elsewhere
         // o* mini want other settings
-        let is_reasoning_model = (provider_settings.model.contains("o")
-            && provider_settings.model.contains("-mini")
-            && provider_settings.host.contains("openai"))
-            || provider_settings.model.contains("gpt-5");
+        let is_reasoning_model = is_openai_reasoning_model(provider_settings);
         if !is_reasoning_model || !provider_settings.host.contains("openai") {
             body["max_tokens"] = json!(settings.max_tokens);
             body["temperature"] = json!(settings.temperature);
         }
+        apply_reasoning_effort(&mut body, provider_settings);
         if settings.provider != "mistral" {
             body["user"] = json!(env::var("USER").unwrap_or_else(|_| "user".to_string()));
         }
@@ -140,6 +156,7 @@ fn perform_request_loop(
                     content: json!({
                         "tool_calls": stream_result.tool_calls
                     }),
+                    response_items: stream_result.response_items.clone(),
                 };
                 conversation_state.messages.push(assistant_message);
 
@@ -148,6 +165,10 @@ fn perform_request_loop(
                 // (prevents silent empty tool names/args that previously caused unexplainable behavior).
                 if let Some(tool_registry) = tools {
                     for tool_call in &stream_result.tool_calls {
+                        let tool_id = tool_call
+                            .get("id")
+                            .and_then(|id| id.as_str())
+                            .unwrap_or("unknown");
                         let tool_name = match tool_call
                             .get("function")
                             .and_then(|f| f.get("name"))
@@ -159,13 +180,15 @@ fn perform_request_loop(
                                 eprintln!("[AGENT ERROR] {}", err);
                                 conversation_state.messages.push(Message {
                                     role: "tool".to_string(),
-                                    content: json!({"content": err}),
+                                    content: json!({
+                                        "tool_call_id": tool_id,
+                                        "content": err
+                                    }),
+                                    response_items: Vec::new(),
                                 });
                                 continue;
                             }
                         };
-
-                        let tool_id = tool_call.get("id").and_then(|id| id.as_str()).unwrap_or("unknown");
 
                         let args_str = tool_call
                             .get("function")
@@ -176,7 +199,8 @@ fn perform_request_loop(
                         let args: Value = match serde_json::from_str(args_str) {
                             Ok(a) => a,
                             Err(e) => {
-                                let err = format!("Failed to parse tool args for {}: {}", tool_name, e);
+                                let err =
+                                    format!("Failed to parse tool args for {}: {}", tool_name, e);
                                 eprintln!("[AGENT] {}", err);
                                 json!({ "error": err })
                             }
@@ -199,6 +223,7 @@ fn perform_request_loop(
                                 "tool_call_id": tool_id,
                                 "content": result_content
                             }),
+                            response_items: Vec::new(),
                         };
                         conversation_state.messages.push(tool_message);
                     }
@@ -223,6 +248,7 @@ fn perform_request_loop(
             let assistant_message = Message {
                 role: stream_result.role,
                 content: Value::String(stream_result.content),
+                response_items: stream_result.response_items,
             };
             conversation_state.messages.push(assistant_message);
 
@@ -240,10 +266,28 @@ fn perform_request_loop(
     }
 }
 
+fn is_openai_reasoning_model(provider_settings: &ProviderSettings) -> bool {
+    provider_settings.host.contains("openai")
+        && ((provider_settings.model.contains('o') && provider_settings.model.contains("-mini"))
+            || provider_settings.model.contains("gpt-5"))
+}
+
+fn apply_reasoning_effort(body: &mut Value, provider_settings: &ProviderSettings) {
+    let Some(reasoning_effort) = &provider_settings.reasoning_effort else {
+        return;
+    };
+    if provider_settings.uses_responses_api() {
+        body["reasoning"] = json!({"effort": reasoning_effort});
+    } else {
+        body["reasoning_effort"] = json!(reasoning_effort);
+    }
+}
+
 struct StreamResult {
     role: String,
     content: String,
     tool_calls: Vec<Value>,
+    response_items: Vec<Value>,
 }
 
 fn handle_stream(
@@ -259,6 +303,7 @@ fn handle_stream(
         String::new()
     };
     let mut tool_calls: Vec<Value> = Vec::new();
+    let mut response_items: Vec<Value> = Vec::new();
     let mut tool_call_buffer: std::collections::HashMap<i64, Value> =
         std::collections::HashMap::new();
 
@@ -297,6 +342,7 @@ fn handle_stream(
                                     role,
                                     content: full_content,
                                     tool_calls,
+                                    response_items,
                                 };
                             }
                             if !json_str.is_empty() {
@@ -355,6 +401,15 @@ fn handle_stream(
                                                     }
                                                 }
                                             }
+                                        } else if provider_settings.uses_responses_api() {
+                                            handle_responses_event(
+                                                &value,
+                                                suppress_print,
+                                                &mut full_content,
+                                                &mut tool_calls,
+                                                &mut response_items,
+                                            );
+                                            role = "assistant".to_string();
                                         } else {
                                             // Handle OpenAI response
                                             if let Some(choices) =
@@ -440,7 +495,10 @@ fn handle_stream(
                                     Err(e) => {
                                         // Explicitly surface JSON parse errors in the SSE stream.
                                         // Previously swallowed → caused silent failures in agent loop.
-                                        let err_msg = format!("Stream JSON parse error: {}. JSON: {}", e, json_str);
+                                        let err_msg = format!(
+                                            "Stream JSON parse error: {}. JSON: {}",
+                                            e, json_str
+                                        );
                                         eprintln!("\n[AGENT] {}", err_msg);
                                         // Feed error back to model so it can recover
                                         full_content.push_str(&format!("\n\n[ERROR] {}", err_msg));
@@ -476,6 +534,108 @@ fn handle_stream(
         role,
         content: full_content,
         tool_calls,
+        response_items,
+    }
+}
+
+fn handle_responses_event(
+    event: &Value,
+    suppress_print: bool,
+    full_content: &mut String,
+    tool_calls: &mut Vec<Value>,
+    response_items: &mut Vec<Value>,
+) {
+    match event.get("type").and_then(Value::as_str).unwrap_or("") {
+        "response.output_text.delta" | "response.refusal.delta" => {
+            if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                if !suppress_print {
+                    print!("{}", delta);
+                    io::stdout().flush().unwrap();
+                }
+                full_content.push_str(delta);
+            }
+        }
+        "response.output_item.done" => {
+            if let Some(item) = event.get("item") {
+                record_response_item(item, tool_calls, response_items);
+            }
+        }
+        "response.completed" => {
+            if let Some(output) = event
+                .get("response")
+                .and_then(|response| response.get("output"))
+                .and_then(Value::as_array)
+            {
+                for item in output {
+                    record_response_item(item, tool_calls, response_items);
+                }
+                if full_content.is_empty() {
+                    append_response_text(output, full_content);
+                }
+            }
+        }
+        "error" | "response.failed" => {
+            let message = event
+                .get("error")
+                .and_then(|error| error.get("message"))
+                .and_then(Value::as_str)
+                .unwrap_or("Responses API stream failed");
+            eprintln!("\n[AGENT] {}", message);
+        }
+        _ => {}
+    }
+}
+
+fn record_response_item(
+    item: &Value,
+    tool_calls: &mut Vec<Value>,
+    response_items: &mut Vec<Value>,
+) {
+    if item.get("type").and_then(Value::as_str) == Some("function_call") {
+        let call_id = item.get("call_id").and_then(Value::as_str).unwrap_or("");
+        if !call_id.is_empty()
+            && !tool_calls
+                .iter()
+                .any(|call| call.get("id").and_then(Value::as_str) == Some(call_id))
+        {
+            tool_calls.push(json!({
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": item.get("name").and_then(Value::as_str).unwrap_or(""),
+                    "arguments": item.get("arguments").and_then(Value::as_str).unwrap_or("{}")
+                }
+            }));
+        }
+    }
+
+    let item_id = item.get("id").and_then(Value::as_str);
+    let already_recorded = item_id.is_some_and(|id| {
+        response_items
+            .iter()
+            .any(|existing| existing.get("id").and_then(Value::as_str) == Some(id))
+    });
+    if !already_recorded {
+        response_items.push(item.clone());
+    }
+}
+
+fn append_response_text(output: &[Value], full_content: &mut String) {
+    for item in output {
+        if item.get("type").and_then(Value::as_str) != Some("message") {
+            continue;
+        }
+        if let Some(content) = item.get("content").and_then(Value::as_array) {
+            for part in content {
+                if matches!(
+                    part.get("type").and_then(Value::as_str),
+                    Some("output_text" | "refusal")
+                ) && let Some(text) = part.get("text").and_then(Value::as_str)
+                {
+                    full_content.push_str(text);
+                }
+            }
+        }
     }
 }
 
@@ -510,6 +670,88 @@ fn convert_message_to_openai(msg: &Message) -> Value {
         "role": msg.role,
         "content": msg.content
     })
+}
+
+fn convert_messages_to_responses(messages: &[Message]) -> Vec<Value> {
+    let mut input = Vec::new();
+
+    for msg in messages {
+        if !msg.response_items.is_empty() {
+            input.extend(msg.response_items.iter().cloned());
+            continue;
+        }
+
+        if msg.role == "tool" {
+            if let Some(obj) = msg.content.as_object() {
+                input.push(json!({
+                    "type": "function_call_output",
+                    "call_id": obj.get("tool_call_id").and_then(Value::as_str).unwrap_or(""),
+                    "output": obj.get("content").and_then(Value::as_str).unwrap_or("")
+                }));
+            }
+            continue;
+        }
+
+        if msg.role == "assistant"
+            && let Some(tool_calls) = msg.content.get("tool_calls").and_then(Value::as_array)
+        {
+            for tool_call in tool_calls {
+                input.push(json!({
+                    "type": "function_call",
+                    "call_id": tool_call.get("id").and_then(Value::as_str).unwrap_or(""),
+                    "name": tool_call
+                        .get("function")
+                        .and_then(|function| function.get("name"))
+                        .and_then(Value::as_str)
+                        .unwrap_or(""),
+                    "arguments": tool_call
+                        .get("function")
+                        .and_then(|function| function.get("arguments"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("{}")
+                }));
+            }
+            continue;
+        }
+
+        input.push(json!({
+            "role": msg.role,
+            "content": convert_content_to_responses(&msg.content)
+        }));
+    }
+
+    input
+}
+
+fn convert_content_to_responses(content: &Value) -> Value {
+    let Some(parts) = content.as_array() else {
+        return content.clone();
+    };
+
+    Value::Array(
+        parts
+            .iter()
+            .filter_map(|part| match part.get("type").and_then(Value::as_str) {
+                Some("text") => Some(json!({
+                    "type": "input_text",
+                    "text": part.get("text").and_then(Value::as_str).unwrap_or("")
+                })),
+                Some("image_url") => {
+                    let image = part.get("image_url")?;
+                    let mut response_part = json!({
+                        "type": "input_image",
+                        "image_url": image.get("url").and_then(Value::as_str).unwrap_or("")
+                    });
+                    if let Some(detail) = image.get("detail") {
+                        response_part["detail"] = detail.clone();
+                    }
+                    Some(response_part)
+                }
+                Some("input_text" | "input_image" | "input_file") => Some(part.clone()),
+                _ => None,
+            })
+            .collect(),
+    )
 }
 
 /// Convert a Message to Gemini format
@@ -726,5 +968,114 @@ pub fn cleanup_temp_files() {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn responses_input_replays_reasoning_and_function_calls() {
+        let reasoning = json!({"id": "rs_1", "type": "reasoning", "summary": []});
+        let function_call = json!({
+            "id": "fc_1",
+            "type": "function_call",
+            "call_id": "call_1",
+            "name": "read_file",
+            "arguments": "{\"path\":\"README.md\"}"
+        });
+        let messages = vec![
+            Message {
+                role: "assistant".to_string(),
+                content: json!({"tool_calls": []}),
+                response_items: vec![reasoning.clone(), function_call.clone()],
+            },
+            Message {
+                role: "tool".to_string(),
+                content: json!({
+                    "tool_call_id": "call_1",
+                    "content": "file contents"
+                }),
+                response_items: Vec::new(),
+            },
+        ];
+
+        let input = convert_messages_to_responses(&messages);
+
+        assert_eq!(input[0], reasoning);
+        assert_eq!(input[1], function_call);
+        assert_eq!(input[2]["type"], "function_call_output");
+        assert_eq!(input[2]["call_id"], "call_1");
+        assert_eq!(input[2]["output"], "file contents");
+    }
+
+    #[test]
+    fn responses_content_converts_chat_style_images() {
+        let content = json!([
+            {"type": "text", "text": "describe this"},
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/png;base64,abc", "detail": "high"}
+            }
+        ]);
+
+        let converted = convert_content_to_responses(&content);
+
+        assert_eq!(converted[0]["type"], "input_text");
+        assert_eq!(converted[1]["type"], "input_image");
+        assert_eq!(converted[1]["image_url"], "data:image/png;base64,abc");
+        assert_eq!(converted[1]["detail"], "high");
+    }
+
+    #[test]
+    fn responses_stream_event_preserves_items_and_normalizes_tool_calls() {
+        let mut content = String::new();
+        let mut tool_calls = Vec::new();
+        let mut response_items = Vec::new();
+        let event = json!({
+            "type": "response.output_item.done",
+            "item": {
+                "id": "fc_1",
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "read_file",
+                "arguments": "{\"path\":\"README.md\"}"
+            }
+        });
+
+        handle_responses_event(
+            &event,
+            true,
+            &mut content,
+            &mut tool_calls,
+            &mut response_items,
+        );
+
+        assert_eq!(tool_calls[0]["id"], "call_1");
+        assert_eq!(tool_calls[0]["function"]["name"], "read_file");
+        assert_eq!(response_items[0]["id"], "fc_1");
+    }
+
+    #[test]
+    fn reasoning_effort_uses_endpoint_specific_shape() {
+        let mut provider = ProviderSettings {
+            model: "gpt-5.6-terra".to_string(),
+            host: "api.openai.com".to_string(),
+            endpoint: "/v1/chat/completions".to_string(),
+            api_key_variable: "OPENAI_API_KEY".to_string(),
+            reasoning_effort: Some("medium".to_string()),
+        };
+        let mut chat_body = json!({});
+        apply_reasoning_effort(&mut chat_body, &provider);
+
+        provider.endpoint = "/v1/responses".to_string();
+        let mut responses_body = json!({});
+        apply_reasoning_effort(&mut responses_body, &provider);
+
+        assert_eq!(chat_body["reasoning_effort"], "medium");
+        assert!(chat_body.get("reasoning").is_none());
+        assert_eq!(responses_body["reasoning"]["effort"], "medium");
+        assert!(responses_body.get("reasoning_effort").is_none());
     }
 }

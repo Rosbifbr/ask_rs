@@ -54,6 +54,20 @@ impl ToolRegistry {
             .collect()
     }
 
+    pub fn to_responses_format(&self) -> Vec<Value> {
+        self.tools
+            .values()
+            .map(|tool| {
+                json!({
+                    "type": "function",
+                    "name": tool.name(),
+                    "description": tool.description(),
+                    "parameters": tool.parameters()
+                })
+            })
+            .collect()
+    }
+
     pub fn to_gemini_format(&self) -> Value {
         let functions: Vec<Value> = self
             .tools

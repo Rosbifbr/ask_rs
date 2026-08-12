@@ -143,6 +143,7 @@ fn main() {
             Some(Message {
                 role,
                 content: startup_message.into(),
+                response_items: Vec::new(),
             })
         } else {
             None

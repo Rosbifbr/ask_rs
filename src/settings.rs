@@ -3,12 +3,25 @@ use std::collections::HashMap;
 use std::env;
 use std::fs;
 
+fn default_endpoint() -> String {
+    "/v1/chat/completions".to_string()
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ProviderSettings {
     pub model: String,
     pub host: String,
+    #[serde(default = "default_endpoint")]
     pub endpoint: String,
     pub api_key_variable: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+}
+
+impl ProviderSettings {
+    pub fn uses_responses_api(&self) -> bool {
+        self.endpoint.trim_end_matches('/') == "/v1/responses"
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -36,6 +49,7 @@ pub fn get_settings() -> Settings {
             host: "api.openai.com".to_string(),
             endpoint: "/v1/chat/completions".to_string(),
             api_key_variable: "OPENAI_API_KEY".to_string(),
+            reasoning_effort: None,
         },
     );
     default_providers.insert(
@@ -45,6 +59,7 @@ pub fn get_settings() -> Settings {
             host: "generativelanguage.googleapis.com".to_string(),
             endpoint: "".to_string(),
             api_key_variable: "GEMINI_API_KEY".to_string(),
+            reasoning_effort: None,
         },
     );
 
@@ -100,5 +115,39 @@ OPERATIONAL GUIDELINES:
             println!("WARNING: Using default settings. Error: {}.", e);
             default_settings
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_defaults_to_chat_completions() {
+        let provider: ProviderSettings = serde_json::from_value(serde_json::json!({
+            "model": "gpt-4o-mini",
+            "host": "api.openai.com",
+            "api_key_variable": "OPENAI_API_KEY"
+        }))
+        .unwrap();
+
+        assert_eq!(provider.endpoint, "/v1/chat/completions");
+        assert!(!provider.uses_responses_api());
+        assert_eq!(provider.reasoning_effort, None);
+    }
+
+    #[test]
+    fn responses_endpoint_selects_responses_mode() {
+        let provider: ProviderSettings = serde_json::from_value(serde_json::json!({
+            "model": "gpt-5.6-terra",
+            "host": "api.openai.com",
+            "endpoint": "/v1/responses/",
+            "api_key_variable": "OPENAI_API_KEY",
+            "reasoning_effort": "medium"
+        }))
+        .unwrap();
+
+        assert!(provider.uses_responses_api());
+        assert_eq!(provider.reasoning_effort.as_deref(), Some("medium"));
     }
 }
